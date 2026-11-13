@@ -142,8 +142,18 @@ async fn connect(registry: &Registry, session: &str) -> Result<Stream> {
     }
 }
 
+/// How long an owner may take to answer; it answers from its event loop, so this is generous.
+const ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Sends one request to the session's owner. Fails with [`Error::Io`] when no owner runs.
 pub async fn request(registry: &Registry, session: &str, request: &Request) -> Result<Reply> {
+    match tokio::time::timeout(ANSWER_TIMEOUT, exchange(registry, session, request)).await {
+        Ok(reply) => reply,
+        Err(_) => Err(Error::Agent(format!("the owner of {session} did not answer within {} s", ANSWER_TIMEOUT.as_secs()))),
+    }
+}
+
+async fn exchange(registry: &Registry, session: &str, request: &Request) -> Result<Reply> {
     let stream = connect(registry, session).await?;
     let (reader, mut writer) = tokio::io::split(stream);
     let mut line = serde_json::to_string(request).map_err(|error| Error::Invalid(error.to_string()))?;
