@@ -55,9 +55,20 @@ fn detach(command: &mut std::process::Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
+        use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        // Windows hands every inheritable handle to a child. Inherited, this process's stdout and stderr pipes would
+        // stay open while the owner runs, and a caller reading `harnessmux run`'s output would wait for the owner.
+        for std_handle in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: GetStdHandle and SetHandleInformation take no pointers; an invalid or null handle makes the
+            // call fail, which leaves the flag as it was.
+            unsafe {
+                SetHandleInformation(GetStdHandle(std_handle), HANDLE_FLAG_INHERIT, 0);
+            }
+        }
     }
 }
 

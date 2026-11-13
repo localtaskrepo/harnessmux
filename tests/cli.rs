@@ -48,18 +48,31 @@ impl Home {
         self.finish(child, args)
     }
 
-    /// Waits for a command, at most 40 s; a hung one fails with the sessions' logs.
+    /// Waits for a command, at most 40 s; a hung one fails with the sessions' logs. Its output is read meanwhile:
+    /// a full pipe would block it.
     fn finish(&self, mut child: std::process::Child, args: &[&str]) -> Output {
+        fn drain(pipe: Option<impl std::io::Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                if let Some(mut pipe) = pipe {
+                    let _ = pipe.read_to_end(&mut bytes);
+                }
+                bytes
+            })
+        }
+        let (stdout, stderr) = (drain(child.stdout.take()), drain(child.stderr.take()));
         let deadline = Instant::now() + Duration::from_secs(40);
-        while child.try_wait().unwrap().is_none() {
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
             if Instant::now() > deadline {
                 let _ = child.kill();
-                let output = child.wait_with_output().unwrap();
-                panic!("harnessmux {args:?} hung\n{}\n{}", text(&output), self.logs());
+                panic!("harnessmux {args:?} hung\n{}", self.logs());
             }
             std::thread::sleep(Duration::from_millis(20));
-        }
-        child.wait_with_output().unwrap()
+        };
+        Output { status, stdout: stdout.join().unwrap(), stderr: stderr.join().unwrap() }
     }
 
     /// Every session's event log and owner log.
