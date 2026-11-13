@@ -1,0 +1,36 @@
+[package]
+name = "harnessmux"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Run coding-agent CLI sessions (Claude, Codex, Copilot, Gemini, Kilo and more) over the Agent Client Protocol: named sessions, send, attach, resume, cancel, one model/effort/permission mapping and a JSONL event stream"
+license = "MIT"
+repository = "https://github.com/localtaskrepo/harnessmux"
+readme = "README.md"
+keywords = ["acp", "agent", "claude", "codex", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+include = ["/src/**", "/tests/**", "/agents.toml", "/README.md", "/LICENSE", "/CHANGELOG.md"]
+
+[dependencies]
+agent-client-protocol = { version = "5.2.0", features = ["process", "stdio", "unstable_end_turn_token_usage"] }
+clap = { version = "4.6.7", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+toml = { version = "1.2.1", default-features = false, features = ["parse", "serde"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints.clippy]
+allow_attributes_without_reason = "warn" # #[allow] needs reason = "..."; prefer #[expect], which reports stale ones
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "warn" # no unwrap outside tests (clippy.toml allows it there); use ? or expect("why it cannot fail")
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = "z" # size over speed; give a hot dependency opt-level = 3 in [profile.release.package.<name>]
+panic = "abort"
+strip = "symbols"

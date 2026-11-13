@@ -1,0 +1,124 @@
+# The agent table: how harnessmux starts each agent and which ids its options have.
+#
+# Shipped with the crate and read at run time. A user file at <config dir>/harnessmux/agents.toml (see the README)
+# overrides it per agent and per key, so an adapter bump or a renamed option needs no new build.
+#
+# kind      acp (an ACP server on stdio), amp (Amp's headless stream-json mode) or t3 (T3 Code's thread CLI)
+# command   program and arguments. For an npm adapter, `adapter` names the package, its pinned version and its binary:
+#           harnessmux installs it once into its data directory and runs it from there.
+# options   ids of the agent's ACP config options for model, effort and mode. An option the agent doesn't advertise is
+#           skipped with a notice.
+# effort    harnessmux effort (low, medium, high, xhigh, max) -> the agent's value
+# modes     harnessmux permissions (read-only, workspace, full) -> the agent's mode value
+# paths     extra directories searched for the program when it is not on PATH (~ is the home directory)
+# live      true when a harnessmux release ran this agent end to end; false: set up from its docs only
+
+[agents.claude]
+kind = "acp"
+command = ["claude-agent-acp"]
+adapter = { npm = "@agentclientprotocol/claude-agent-acp", version = "0.107.0", bin = "claude-agent-acp" }
+requires = "claude"
+docs = "https://github.com/agentclientprotocol/claude-agent-acp"
+live = true
+options = { model = "model", effort = "effort", mode = "mode" }
+effort = { low = "low", medium = "medium", high = "high", xhigh = "xhigh", max = "max" }
+modes = { read-only = "plan", workspace = "acceptEdits", full = "bypassPermissions" }
+
+[agents.codex]
+kind = "acp"
+command = ["codex-acp"]
+adapter = { npm = "@agentclientprotocol/codex-acp", version = "2.6.0", bin = "codex-acp" }
+requires = "codex"
+docs = "https://github.com/agentclientprotocol/codex-acp"
+live = true
+options = { model = "model", effort = "reasoning_effort", mode = "mode" }
+effort = { low = "low", medium = "medium", high = "high", xhigh = "xhigh", max = "max" }
+modes = { read-only = "read-only", workspace = "workspace-write", full = "agent-full-access" }
+
+[agents.copilot]
+kind = "acp"
+command = ["copilot", "--acp", "--stdio"]
+requires = "copilot"
+docs = "https://docs.github.com/en/copilot/how-tos/use-copilot-agents/use-copilot-cli"
+live = true
+options = { model = "model", mode = "mode" }
+effort = {}
+modes = { read-only = "https://agentclientprotocol.com/protocol/session-modes#plan", workspace = "https://agentclientprotocol.com/protocol/session-modes#agent", full = "https://agentclientprotocol.com/protocol/session-modes#autopilot" }
+
+[agents.gemini]
+kind = "acp"
+command = ["gemini", "--acp"]
+requires = "gemini"
+docs = "https://github.com/google-gemini/gemini-cli"
+live = false
+options = { model = "model", mode = "mode" }
+effort = {}
+modes = { read-only = "plan", workspace = "autoEdit", full = "yolo" }
+
+[agents.cursor]
+kind = "acp"
+command = ["cursor-agent", "acp"]
+requires = "cursor-agent"
+docs = "https://cursor.com/docs/cli/acp"
+live = false
+options = { model = "model", mode = "mode" }
+effort = {}
+modes = { read-only = "plan", workspace = "agent", full = "agent" }
+
+[agents.droid]
+kind = "acp"
+command = ["droid", "exec", "--output-format", "acp"]
+requires = "droid"
+docs = "https://docs.factory.ai/cli/configuration/acp"
+live = false
+options = { model = "model", effort = "reasoning_effort", mode = "mode" }
+effort = { low = "low", medium = "medium", high = "high", xhigh = "high", max = "high" }
+modes = {}
+
+[agents.opencode]
+kind = "acp"
+command = ["opencode", "acp"]
+requires = "opencode"
+docs = "https://opencode.ai/docs/acp/"
+live = false
+options = { model = "model", effort = "variant", mode = "mode" }
+effort = { low = "low", medium = "medium", high = "high", xhigh = "max", max = "max" }
+modes = { read-only = "plan", workspace = "build", full = "build" }
+
+[agents.kilo]
+kind = "acp"
+command = ["kilo", "acp"]
+requires = "kilo"
+docs = "https://kilo.ai/docs/cli"
+live = false
+options = { model = "model", effort = "variant", mode = "mode" }
+effort = { low = "low", medium = "medium", high = "high", xhigh = "max", max = "max" }
+modes = { read-only = "plan", workspace = "code", full = "code" }
+
+[agents.antigravity]
+kind = "acp"
+command = ["agy_acp_server"]
+requires = "agy_acp_server"
+docs = "https://antigravity.google/docs"
+live = false
+options = { model = "model", mode = "mode" }
+effort = {}
+modes = {}
+
+# No ACP server known for Amp: its headless stream-json mode behind the same session interface, without resume.
+[agents.amp]
+kind = "amp"
+command = ["amp"]
+requires = "amp"
+docs = "https://ampcode.com/manual#cli"
+live = false
+
+# T3 Code threads through T3's CLI (`t3 thread start/send/show`). The model needs a provider instance id
+# (`--provider claudeAgent`, `codex`); effort and child threads are not in T3's CLI.
+[agents.t3]
+kind = "t3"
+command = ["t3"]
+requires = "t3"
+paths = ["~/.t3/bin"]
+docs = "https://t3.codes"
+live = true

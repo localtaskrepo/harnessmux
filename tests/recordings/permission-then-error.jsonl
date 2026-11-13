@@ -1,0 +1,16 @@
+{"to":"agent","msg":{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1}}}
+{"to":"client","msg":{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"resume":{}}},"agentInfo":{"name":"recorded-agent","version":"1.0.0"},"authMethods":[]}}}
+{"to":"agent","msg":{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/work/repo","mcpServers":[]}}}
+{"to":"client","msg":{"jsonrpc":"2.0","id":1,"result":{"sessionId":"s-1","configOptions":[{"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":"default","options":[{"value":"default","name":"Default"},{"value":"plan","name":"Plan"},{"value":"acceptEdits","name":"Accept edits"}]}]}}}
+{"to":"agent","msg":{"jsonrpc":"2.0","id":2,"method":"session/set_config_option","params":{"sessionId":"s-1","configId":"mode","value":"acceptEdits"}}}
+{"to":"client","msg":{"jsonrpc":"2.0","id":2,"result":{"configOptions":[{"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":"acceptEdits","options":[{"value":"default","name":"Default"},{"value":"plan","name":"Plan"},{"value":"acceptEdits","name":"Accept edits"}]}]}}}
+{"to":"agent","msg":{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"s-1","prompt":[{"type":"text","text":"Fix add()"}]}}}
+{"to":"client","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-1","update":{"sessionUpdate":"tool_call","toolCallId":"t-1","title":"Edit calc.py","kind":"edit","status":"pending"}}}}
+{"to":"client","msg":{"jsonrpc":"2.0","id":900,"method":"session/request_permission","params":{"sessionId":"s-1","toolCall":{"toolCallId":"t-1","title":"Edit calc.py","kind":"edit"},"options":[{"optionId":"allow","name":"Allow","kind":"allow_once"},{"optionId":"reject","name":"Reject","kind":"reject_once"}]}}}
+{"to":"agent","msg":{"jsonrpc":"2.0","id":900,"result":{"outcome":{"outcome":"selected","optionId":"allow"}}}}
+{"to":"client","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"t-1","status":"completed"}}}}
+{"to":"client","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Fixed add() to return a + b."}}}}}
+{"to":"client","msg":{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn","usage":{"totalTokens":120,"inputTokens":100,"outputTokens":20}}}}
+{"to":"agent","msg":{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":"s-1","prompt":[{"type":"text","text":"And now?"}]}}}
+{"to":"client","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"unexpected status 404 Not Found: {\"error\":{\"code\":\"model_not_found\",\"message\":\"The model `gpt-6.1-sol` does not exist or you do not have access to it.\"}}"}}}}}
+{"to":"client","msg":{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}}

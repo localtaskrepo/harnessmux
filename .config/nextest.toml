@@ -1,0 +1,9 @@
+# Copy to .config/nextest.toml. Defaults already fail fast and hide passing output.
+
+[profile.default]
+status-level = "fail" # no line per passing test
+slow-timeout = { period = "60s", terminate-after = 2 } # a hung test fails after 2 minutes instead of blocking the run
+
+[profile.ci]
+failure-output = "immediate-final" # failures again at the end of the log, where CI readers look
+junit.path = "junit.xml" # target/nextest/ci/junit.xml

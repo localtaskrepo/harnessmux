@@ -1,0 +1,4 @@
+# Only what differs from clippy's defaults.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-dbg-in-tests = true

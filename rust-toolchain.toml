@@ -1,0 +1,7 @@
+# Same compiler and clippy locally, in CI and for releases: new clippy lints arrive with new Rust versions, and an
+# unpinned "stable" broke a lotar release (2026-09). Dependabot (rust-toolchain ecosystem) proposes each new minor
+# version as a PR, so nobody bumps this by hand. "1.99" takes the latest 1.99.x patch.
+[toolchain]
+channel = "1.99"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

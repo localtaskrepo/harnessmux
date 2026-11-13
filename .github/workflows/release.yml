@@ -1,0 +1,77 @@
+# Release from a v* tag: CI, then static binaries per platform, then one GitHub release with checksums.
+# Set BIN_NAME. The tag must match the version in Cargo.toml.
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+env:
+  BIN_NAME: harnessmux
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: ci
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: macos-latest, target: x86_64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+          - { os: windows-11-arm, target: aarch64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          target: ${{ matrix.target }}
+          cache-key: ${{ matrix.target }}
+      - name: Tag matches Cargo.toml
+        shell: bash
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          [ "${GITHUB_REF_NAME#v}" = "$version" ] || { echo "tag $GITHUB_REF_NAME does not match Cargo.toml $version"; exit 1; }
+      - if: contains(matrix.target, 'musl') # only crates that compile C need the musl gcc wrapper
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        if: runner.os != 'Windows'
+        run: |
+          mkdir out
+          tar -czf "out/$BIN_NAME-$GITHUB_REF_NAME-${{ matrix.target }}.tar.gz" -C target/${{ matrix.target }}/release "$BIN_NAME"
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory out | Out-Null
+          Compress-Archive "target/${{ matrix.target }}/release/$env:BIN_NAME.exe" "out/$env:BIN_NAME-$env:GITHUB_REF_NAME-${{ matrix.target }}.zip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: out/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: out
+          merge-multiple: true
+      - run: cd out && sha256sum * > SHA256SUMS
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: out/*
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
