@@ -44,7 +44,35 @@ impl Home {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        self.cmd(args).output().unwrap()
+        let child = self.cmd(args).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        self.finish(child, args)
+    }
+
+    /// Waits for a command, at most 40 s; a hung one fails with the sessions' logs.
+    fn finish(&self, mut child: std::process::Child, args: &[&str]) -> Output {
+        let deadline = Instant::now() + Duration::from_secs(40);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!("harnessmux {args:?} hung\n{}\n{}", text(&output), self.logs());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        child.wait_with_output().unwrap()
+    }
+
+    /// Every session's event log and owner log.
+    fn logs(&self) -> String {
+        let dir = self.dir.path().join("state/sessions");
+        let mut out = String::new();
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".jsonl") || name.ends_with(".log") {
+                out.push_str(&format!("== {name}\n{}\n", std::fs::read_to_string(entry.path()).unwrap_or_default()));
+            }
+        }
+        out
     }
 
     fn events(&self, name: &str) -> Vec<Value> {
@@ -58,7 +86,7 @@ impl Home {
             if let Some(event) = self.events(name).into_iter().find(|e| e["type"] == event_type) {
                 return event;
             }
-            assert!(Instant::now() < deadline, "no {event_type} in {:#?}", self.events(name));
+            assert!(Instant::now() < deadline, "no {event_type}\n{}", self.logs());
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -160,7 +188,12 @@ fn a_permission_request_waits_for_answer_and_an_error_reply_fails_the_turn() {
         r#"options = { mode = "mode" }
 modes = { workspace = "acceptEdits" }"#,
     )]);
-    let run = home.cmd(&["run", "rec", "--name", "p", "--on-permission", "ask", "Fix add()"]).stdout(std::process::Stdio::piped()).spawn().unwrap();
+    let run = home
+        .cmd(&["run", "rec", "--name", "p", "--on-permission", "ask", "Fix add()"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
     let requested = home.wait_for("p", "permission.requested");
     assert_eq!(requested["request"], "p1");
     assert_eq!(requested["title"], "Edit calc.py");
@@ -173,7 +206,7 @@ modes = { workspace = "acceptEdits" }"#,
     assert!(String::from_utf8_lossy(&wrong.stderr).contains("options: allow, reject"), "{}", text(&wrong));
     let answered = home.run(&["answer", "p", "p1", "allow"]);
     assert!(answered.status.success(), "{}", text(&answered));
-    let finished = run.wait_with_output().unwrap();
+    let finished = home.finish(run, &["run", "rec"]);
     assert!(finished.status.success(), "{}", text(&finished));
     assert_eq!(String::from_utf8_lossy(&finished.stdout).trim(), "Fixed add() to return a + b.", "{}\n{:#?}", text(&finished), home.events("p"));
 

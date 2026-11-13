@@ -45,8 +45,3 @@ jobs:
         with:
           tool: cargo-nextest
       - run: cargo nextest run --workspace --all-features --profile ci
-      # A hung test leaves its HARNESSMUX_HOME behind: show the sessions' logs and the owners' stderr.
-      - name: Session logs of failed tests
-        if: failure()
-        shell: bash
-        run: find "${RUNNER_TEMP:-/tmp}" "${TMPDIR:-/tmp}" "${TEMP:-/tmp}" -path '*state/sessions/*' \( -name '*.jsonl' -o -name '*.log' \) 2>/dev/null | while read -r f; do echo "== $f"; cut -c1-300 "$f"; done
