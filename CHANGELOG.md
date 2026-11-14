@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.3 (2026-11-14)
+
+- A t3 turn whose `t3` exits with an error while the thread still runs, or because the T3 Code server doesn't answer,
+  follows the thread's run instead of failing; reads that find the server down wait up to 60 minutes for it (lotar
+  DEV-467).
+
 ## 0.1.2 (2026-11-14)
 
 - `session.started` has the agent session's `link` (a T3 Code thread's).

@@ -329,8 +329,9 @@ fn start_errors_reach_the_caller_and_leave_no_session() {
     assert!(cfg!(windows) || !Path::new(&socket).exists(), "{socket} left behind");
 }
 
-/// A fake `t3` CLI in `dir`: `thread start` names thread t1 and exits with the code in `start-exit`, `thread send`
-/// hangs, `thread show` prints `show.json`; every call is appended to `calls`.
+/// A fake `t3` CLI in `dir`: `thread start` names thread t1, prints `start-error` (if any) to stderr and exits with
+/// the code in `start-exit`, `thread send` hangs, `thread show` prints `show.json`; every call is appended to `calls`.
+/// While `down` holds a number above 0, `thread show` counts it down and fails as T3's CLI does when its server is down.
 #[cfg(unix)]
 fn fake_t3(home: &Home) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
@@ -343,9 +344,16 @@ fn fake_t3(home: &Home) -> PathBuf {
 dir=$(dirname "$0")
 echo "$1 $2" >> "$dir/calls"
 case "$1 $2" in
-  "thread start") cat > /dev/null; echo "Thread t1" >&2; echo "Started."; exit "$(cat "$dir/start-exit")" ;;
+  "thread start") cat > /dev/null; echo "Thread t1" >&2; cat "$dir/start-error" >&2 2>/dev/null; echo "Started."; exit "$(cat "$dir/start-exit")" ;;
   "thread send") cat > /dev/null; exec sleep 20 ;;
-  "thread show") cat "$dir/show.json" ;;
+  "thread show")
+    down=$(cat "$dir/down" 2>/dev/null || echo 0)
+    if [ "$down" -gt 0 ]; then
+      echo $((down - 1)) > "$dir/down"
+      echo "Could not reach the T3 Code server at http://127.0.0.1:3773" >&2
+      exit 1
+    fi
+    cat "$dir/show.json" ;;
 esac
 "#,
     )
@@ -382,6 +390,27 @@ fn a_t3_thread_waiting_for_an_answer_ends_the_turn_with_its_link() {
     let end = events.iter().find(|e| e["type"] == "turn.finished").unwrap();
     assert_eq!(end["stop_reason"], "waiting_for_answer", "{end}");
     assert!(events.iter().any(|e| e["type"] == "notice" && e["text"].as_str().unwrap().contains("waits for an answer; answer it in T3 Code: https://t3/t1")));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_t3_turn_that_loses_the_server_waits_for_it_and_ends_from_the_thread() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    // t3 exits 1 as the server stops answering; the thread finishes meanwhile (lotar DEV-467).
+    std::fs::write(dir.join("start-exit"), "1").unwrap();
+    std::fs::write(dir.join("start-error"), "Could not reach the T3 Code server at http://127.0.0.1:3773\n").unwrap();
+    show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r2","text":"Done."}]"#);
+    // More failed reads than a run is followed through otherwise, all with the server down.
+    std::fs::write(dir.join("down"), "4").unwrap();
+    let run = home.run(&["run", "t3", "--name", "u", "--provider", "claudeAgent", "--model", "m", "Fix it"]);
+    assert!(run.status.success(), "{}", text(&run));
+    let events = home.events("u");
+    let end = events.iter().find(|e| e["type"] == "turn.finished").unwrap();
+    assert_eq!(end["stop_reason"], "end_turn", "{end}");
+    assert!(!events.iter().any(|e| e["type"] == "turn.failed"), "{events:?}");
+    assert!(events.iter().any(|e| e["type"] == "message" && e["text"] == "Done."), "{events:?}");
+    assert!(events.iter().any(|e| e["type"] == "notice" && e["text"].as_str().unwrap().contains("The T3 Code server doesn't answer")), "{events:?}");
 }
 
 #[cfg(unix)]

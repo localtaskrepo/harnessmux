@@ -2,11 +2,12 @@
 //! `t3 thread send <thread> - --wait`, with the prompt on stdin; `t3 thread show --json` is polled to follow the run.
 //! The thread lives in T3 Code, so a session resumes by sending to it again; when the previous owner stopped during a
 //! turn, the first turn after the resume follows the thread's run instead, as that turn may still run. A thread that
-//! waits for an answer ends the turn with `waiting_for_answer`. T3's CLI has no effort setting, no child threads, no
-//! permission answers and no interrupt.
+//! waits for an answer ends the turn with `waiting_for_answer`. A `t3` that fails while the thread still runs, or
+//! because the T3 Code server doesn't answer, doesn't end the turn: it follows the thread's run, waiting for the server
+//! up to [`SERVER_WAIT`]. T3's CLI has no effort setting, no child threads, no permission answers and no interrupt.
 
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -19,6 +20,10 @@ use crate::event::{EventBody, StopReason, Usage};
 const POLL: Duration = Duration::from_secs(2);
 /// Failed `t3 thread show` reads in a row before following a run gives up.
 const READ_ATTEMPTS: u32 = 3;
+/// How long following a run waits for a T3 Code server that doesn't answer (lotar DEV-467).
+const SERVER_WAIT: Duration = Duration::from_secs(60 * 60);
+/// What T3's CLI prints when its server doesn't answer.
+const UNREACHABLE: &str = "Could not reach the T3 Code server";
 
 pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, reporter: Reporter) -> Result<()> {
     let profile = start.record.profile.clone();
@@ -34,7 +39,7 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
     let mut thread = start.record.agent_session.clone();
     let mut follow = Follow::default();
     if let Some(id) = &thread {
-        if let Some(shown) = show(&program, &start, id).await {
+        if let Shown::Thread(shown) = show(&program, &start, id).await {
             follow.link = link(&shown);
         }
         reporter.event(None, started(&start, id, "resumed", follow.link.clone()), None);
@@ -116,7 +121,7 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
                         if let Some(id) = thread_id(&line).filter(|_| thread.is_none()) {
                             thread = Some(id.clone());
                             reporter.report(Report::AgentSession { id: id.clone(), adapter: None });
-                            let shown = show(&program, &start, &id).await;
+                            let shown = show(&program, &start, &id).await.thread();
                             follow.link = shown.as_ref().and_then(link);
                             reporter.event(None, started(&start, &id, "new", follow.link.clone()), None);
                             for message in shown.map(|shown| follow.take_new(&shown)).unwrap_or_default() {
@@ -130,7 +135,7 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
                     _ => break child.wait().await.map_err(|error| Error::io("waiting for t3", error))?,
                 },
                 _ = poll.tick() => {
-                    if let Some(shown) = match &thread { Some(id) => show(&program, &start, id).await, None => None } {
+                    if let Some(shown) = match &thread { Some(id) => show(&program, &start, id).await.thread(), None => None } {
                         for message in follow.take_new(&shown) {
                             reporter.event(Some(turn), EventBody::MessageDelta { text: message }, None);
                         }
@@ -158,6 +163,16 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
             reporter.event(Some(turn), EventBody::TurnFinished { stop_reason: StopReason::Cancelled, usage: Usage::default() }, None);
             continue;
         }
+        if !matches!(status.code(), Some(0 | 2))
+            && let Some(id) = &thread
+            && still_going(&program, &start, id, &error_text).await
+        {
+            reporter.notice(Some(turn), format!("t3 exited with {status} while the thread goes on; this turn follows its run: {link}"));
+            if !follow_run(&program, &start, id, turn, &mut follow, &mut commands, &reporter).await {
+                return Ok(());
+            }
+            continue;
+        }
         if !reply.is_empty() {
             reporter.event(Some(turn), EventBody::Message { text: reply.clone() }, None);
         }
@@ -183,11 +198,13 @@ async fn follow_run(
 ) -> bool {
     let mut poll = tokio::time::interval(POLL);
     let mut failed_reads = 0;
+    let mut unreachable_since: Option<Instant> = None;
     let shown = loop {
         tokio::select! {
             _ = poll.tick() => match show(program, start, thread).await {
-                Some(shown) => {
+                Shown::Thread(shown) => {
                     failed_reads = 0;
+                    unreachable_since = None;
                     for message in follow.take_new(&shown) {
                         reporter.event(Some(turn), EventBody::MessageDelta { text: message }, None);
                     }
@@ -196,7 +213,18 @@ async fn follow_run(
                         break shown;
                     }
                 }
-                None => {
+                Shown::Unreachable => {
+                    let since = *unreachable_since.get_or_insert_with(|| {
+                        let link = follow.link.clone().unwrap_or_else(|| thread.to_string());
+                        reporter.notice(Some(turn), format!("The T3 Code server doesn't answer; waiting up to {} minutes for it to follow the thread: {link}", SERVER_WAIT.as_secs() / 60));
+                        Instant::now()
+                    });
+                    if since.elapsed() >= SERVER_WAIT {
+                        reporter.event(Some(turn), EventBody::TurnFailed { error: format!("the T3 Code server didn't answer for {} minutes; the thread {thread} may still run", SERVER_WAIT.as_secs() / 60) }, None);
+                        return true;
+                    }
+                }
+                Shown::Unreadable => {
                     failed_reads += 1;
                     if failed_reads >= READ_ATTEMPTS {
                         reporter.event(Some(turn), EventBody::TurnFailed { error: format!("could not read the T3 Code thread {thread} with `t3 thread show`") }, None);
@@ -253,18 +281,49 @@ fn started(start: &Start, id: &str, how: &str, link: Option<String>) -> EventBod
     }
 }
 
-/// `t3 thread show --json` for the thread; none when it can't be read.
-async fn show(program: &std::path::Path, start: &Start, thread: &str) -> Option<Value> {
-    let output = tokio::process::Command::new(program)
+/// Whether a turn whose `t3` failed goes on in T3 Code: the server didn't answer, or the thread still runs.
+async fn still_going(program: &std::path::Path, start: &Start, thread: &str, error_text: &str) -> bool {
+    error_text.contains(UNREACHABLE)
+        || match show(program, start, thread).await {
+            Shown::Thread(shown) => RunState::of(&shown).running,
+            Shown::Unreachable => true,
+            Shown::Unreadable => false,
+        }
+}
+
+/// A `t3 thread show --json` read.
+enum Shown {
+    Thread(Value),
+    /// The T3 Code server didn't answer.
+    Unreachable,
+    Unreadable,
+}
+
+impl Shown {
+    fn thread(self) -> Option<Value> {
+        match self {
+            Self::Thread(shown) => Some(shown),
+            Self::Unreachable | Self::Unreadable => None,
+        }
+    }
+}
+
+async fn show(program: &std::path::Path, start: &Start, thread: &str) -> Shown {
+    let Ok(output) = tokio::process::Command::new(program)
         .args(["thread", "show", thread, "--json", "--messages", "20"])
         .envs(start.spec.env.iter().chain(&start.record.profile.env))
         .current_dir(&start.record.cwd)
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
         .output()
         .await
-        .ok()?;
-    serde_json::from_slice(&output.stdout).ok()
+    else {
+        return Shown::Unreadable;
+    };
+    match serde_json::from_slice(&output.stdout) {
+        Ok(shown) => Shown::Thread(shown),
+        _ if String::from_utf8_lossy(&output.stderr).contains(UNREACHABLE) => Shown::Unreachable,
+        _ => Shown::Unreadable,
+    }
 }
 
 fn link(shown: &Value) -> Option<String> {
