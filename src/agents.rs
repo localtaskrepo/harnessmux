@@ -4,10 +4,12 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::error::{Error, Result};
 use crate::paths;
 use crate::profile::{Effort, Permissions};
+use crate::rules::Rules;
 
 /// The table shipped with this release.
 pub const BUILTIN: &str = include_str!("../agents.toml");
@@ -40,6 +42,18 @@ pub struct OptionIds {
     pub mode: Option<String>,
 }
 
+/// Where an agent takes [`Rules`] natively in a session's `_meta`: dotted paths of the tool lists and the tool pattern
+/// a denied command becomes (`{}` is the command).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RulesMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_tools: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny_tools: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSpec {
     #[serde(default, skip_deserializing)]
@@ -65,6 +79,11 @@ pub struct AgentSpec {
     pub effort: BTreeMap<String, String>,
     #[serde(default)]
     pub modes: BTreeMap<String, String>,
+    /// harnessmux permissions -> the `_meta` sent when a session opens (Claude's sandbox at workspace).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub meta: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules_meta: Option<RulesMeta>,
 }
 
 impl AgentSpec {
@@ -74,6 +93,25 @@ impl AgentSpec {
 
     pub fn mode_value(&self, permissions: Permissions) -> Option<&str> {
         self.modes.get(permissions.as_str()).map(String::as_str)
+    }
+
+    /// The `_meta` a session opens with: the table's `meta` for the permissions, with the rules' tool lists and
+    /// denied commands added where `rules_meta` puts them.
+    pub fn session_meta(&self, permissions: Permissions, rules: &Rules) -> Option<serde_json::Map<String, Value>> {
+        let mut meta = self.meta.get(permissions.as_str()).cloned().unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+        if let Some(native) = &self.rules_meta {
+            if let Some(path) = &native.allow_tools {
+                append(&mut meta, path, rules.allow_tools.iter().cloned());
+            }
+            if let Some(path) = &native.deny_tools {
+                let commands = native.command.iter().flat_map(|pattern| rules.deny_commands.iter().map(move |command| pattern.replace("{}", command)));
+                append(&mut meta, path, rules.deny_tools.iter().cloned().chain(commands));
+            }
+        }
+        match meta {
+            Value::Object(map) if !map.is_empty() => Some(map),
+            _ => None,
+        }
     }
 
     /// Where the pinned adapter is installed: `<data dir>/adapters/<bin>-<version>`.
@@ -117,6 +155,25 @@ impl AgentSpec {
             Error::Agent(format!("{program} for agent {} is not installed or not on PATH.{hint} See {}", self.name, self.docs))
         })?;
         Ok((found, args))
+    }
+}
+
+/// Appends `items` to the list at the dotted `path` of `value`, creating the objects and the list on the way.
+fn append(value: &mut Value, path: &str, items: impl Iterator<Item = String>) {
+    let items: Vec<Value> = items.map(Value::String).collect();
+    if items.is_empty() {
+        return;
+    }
+    let mut at = value;
+    for key in path.split('.') {
+        if !at.is_object() {
+            *at = Value::Object(serde_json::Map::new());
+        }
+        at = at.as_object_mut().expect("made an object above").entry(key).or_insert(Value::Null);
+    }
+    match at {
+        Value::Array(list) => list.extend(items),
+        other => *other = Value::Array(items),
     }
 }
 
@@ -238,6 +295,22 @@ command = ["my-agent", "--acp"]
         assert_eq!(own.get("claude").unwrap().options.effort.as_deref(), Some("effort"));
         let err = table.get("nope").unwrap_err().to_string();
         assert!(err.contains("known agents: amp, antigravity"), "{err}");
+    }
+
+    #[test]
+    fn claude_opens_workspace_sessions_sandboxed_and_takes_rules_natively() {
+        let table = AgentTable::parse(BUILTIN, None).unwrap();
+        let claude = table.get("claude").unwrap();
+        let rules =
+            Rules { deny_commands: vec!["git push".into()], allow_tools: vec!["mcp__lotar".into()], deny_tools: vec!["WebFetch".into()], confine_writes: true };
+        let meta = Value::Object(claude.session_meta(Permissions::Workspace, &rules).unwrap());
+        let options = &meta["claudeCode"]["options"];
+        assert_eq!(options["settings"]["sandbox"], serde_json::json!({"enabled": true, "autoAllowBashIfSandboxed": true}));
+        assert_eq!(options["allowedTools"], serde_json::json!(["mcp__lotar"]));
+        assert_eq!(options["disallowedTools"], serde_json::json!(["WebFetch", "Bash(git push:*)"]));
+        let full = Value::Object(claude.session_meta(Permissions::Full, &Rules::default()).unwrap_or_default());
+        assert_eq!(full.get("claudeCode"), None, "full permissions run unsandboxed");
+        assert_eq!(table.get("codex").unwrap().session_meta(Permissions::Workspace, &rules), None);
     }
 
     #[test]

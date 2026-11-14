@@ -7,6 +7,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::rules::Rules;
 
 macro_rules! named_enum {
     ($(#[$meta:meta])* $name:ident { $($(#[$vmeta:meta])* $variant:ident = $text:literal),+ $(,)? }) => {
@@ -120,6 +121,9 @@ pub struct Profile {
     /// Defaults to [`Permissions::default_policy`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_permission: Option<PermissionPolicy>,
+    /// Commands, tools and write locations decided before the policy.
+    #[serde(default, skip_serializing_if = "Rules::is_empty")]
+    pub rules: Rules,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp_servers: BTreeMap<String, McpServer>,
     /// Extra directories the agent may use (ACP `additionalDirectories`).

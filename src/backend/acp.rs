@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
@@ -254,6 +255,7 @@ impl Driver {
         let cwd = record.cwd.clone();
         let add_dirs = record.profile.add_dirs.clone();
         let mcp = acp_mcp_servers(&record.profile)?;
+        let meta = self.start.spec.session_meta(record.profile.permissions, &record.profile.rules);
         let caps = &init.agent_capabilities;
         let adapter = self.start.spec.adapter.as_ref().map(|a| format!("{}@{}", a.npm, a.version));
         let agent_name = init.agent_info.as_ref().map(|info| format!("{} {}", info.name, info.version));
@@ -264,14 +266,24 @@ impl Driver {
         {
             if caps.session_capabilities.resume.is_some() {
                 let response = cx
-                    .send_request(ResumeSessionRequest::new(previous.clone(), cwd.clone()).additional_directories(add_dirs.clone()).mcp_servers(mcp.clone()))
+                    .send_request(
+                        ResumeSessionRequest::new(previous.clone(), cwd.clone())
+                            .additional_directories(add_dirs.clone())
+                            .mcp_servers(mcp.clone())
+                            .meta(meta.clone()),
+                    )
                     .block_task()
                     .await?;
                 return Ok(self.started(previous, "resumed", adapter_label, &json_of(&response)));
             }
             if caps.load_session {
                 let response = cx
-                    .send_request(LoadSessionRequest::new(previous.clone(), cwd.clone()).additional_directories(add_dirs.clone()).mcp_servers(mcp.clone()))
+                    .send_request(
+                        LoadSessionRequest::new(previous.clone(), cwd.clone())
+                            .additional_directories(add_dirs.clone())
+                            .mcp_servers(mcp.clone())
+                            .meta(meta.clone()),
+                    )
                     .block_task()
                     .await?;
                 // session/load replays the history as updates; the log already has it.
@@ -280,7 +292,7 @@ impl Driver {
             self.reporter
                 .notice(None, format!("{} can neither resume nor load sessions; this is a new session without the earlier turns", self.start.spec.name));
         }
-        let response = cx.send_request(NewSessionRequest::new(cwd).additional_directories(add_dirs).mcp_servers(mcp)).block_task().await?;
+        let response = cx.send_request(NewSessionRequest::new(cwd).additional_directories(add_dirs).mcp_servers(mcp).meta(meta)).block_task().await?;
         let id = response.session_id.to_string();
         Ok(self.started(id, "new", adapter_label, &json_of(&response)))
     }
@@ -411,14 +423,19 @@ impl Driver {
             .collect();
         let title = request.tool_call.fields.title.clone().unwrap_or_else(|| "tool call".into());
         let raw = serde_json::to_value(&request).ok();
-        self.reporter.event(turn, EventBody::PermissionRequested { request: id.clone(), title, options: options.clone() }, raw);
-        let policy = self.start.record.profile.policy();
+        self.reporter.event(turn, EventBody::PermissionRequested { request: id.clone(), title, options: options.clone() }, raw.clone());
+        let record = &self.start.record;
+        let policy = record.profile.policy();
+        let roots: Vec<PathBuf> = std::iter::once(record.cwd.clone()).chain(record.profile.add_dirs.iter().cloned()).collect();
         let reads = matches!(request.tool_call.fields.kind, Some(ToolKind::Read | ToolKind::Search | ToolKind::Think | ToolKind::Fetch));
-        let allow = match policy {
-            PermissionPolicy::Ask => return Some(Pending { responder, options, turn }),
-            PermissionPolicy::Allow => true,
-            PermissionPolicy::AllowReads => reads,
-            PermissionPolicy::Deny => false,
+        let (allow, by) = match raw.as_ref().and_then(|raw| record.profile.rules.decide(raw, &roots)) {
+            Some(decided) => decided,
+            None => match policy {
+                PermissionPolicy::Ask => return Some(Pending { responder, options, turn }),
+                PermissionPolicy::Allow => (true, format!("policy {policy}")),
+                PermissionPolicy::AllowReads => (reads, format!("policy {policy}")),
+                PermissionPolicy::Deny => (false, format!("policy {policy}")),
+            },
         };
         let kinds: &[PermissionOptionKind] = if allow {
             &[PermissionOptionKind::AllowOnce, PermissionOptionKind::AllowAlways]
@@ -431,7 +448,7 @@ impl Driver {
             None => RequestPermissionOutcome::Cancelled,
         };
         let _ = responder.respond(RequestPermissionResponse::new(outcome));
-        self.reporter.event(turn, EventBody::PermissionAnswered { request: id, option: chosen, by: format!("policy {policy}") }, None);
+        self.reporter.event(turn, EventBody::PermissionAnswered { request: id, option: chosen, by }, None);
         None
     }
 }

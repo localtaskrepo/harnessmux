@@ -44,6 +44,7 @@ pub mod paths;
 pub mod profile;
 pub mod registry;
 pub mod replay;
+pub mod rules;
 pub mod session;
 
 pub use agents::{AgentKind, AgentSpec, AgentTable};
@@ -51,4 +52,5 @@ pub use error::{Error, Result};
 pub use event::{Event, EventBody, StopReason, Usage};
 pub use profile::{Effort, McpServer, PermissionPolicy, Permissions, Profile};
 pub use registry::{Registry, SessionRecord, SessionState};
+pub use rules::Rules;
 pub use session::{Session, StartOptions, Status};

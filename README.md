@@ -39,7 +39,7 @@ harnessmux close fix-calc
 
 | Command | What it does |
 | --- | --- |
-| `run <agent> [PROMPT]` | Start a session in the current directory (`--cwd`) and run the first turn. `--model`, `--effort low\|medium\|high\|xhigh\|max`, `--permissions read-only\|workspace\|full`, `--on-permission`, `--option id=value`, `--mcp FILE`, `--add-dir`, `--env`, `--json`, `--no-wait`, `--record FILE`. |
+| `run <agent> [PROMPT]` | Start a session in the current directory (`--cwd`) and run the first turn. `--model`, `--effort low\|medium\|high\|xhigh\|max`, `--permissions read-only\|workspace\|full`, `--on-permission`, `--deny-command`, `--allow-tool`, `--deny-tool`, `--confine-writes`, `--option id=value`, `--mcp FILE`, `--add-dir`, `--env`, `--json`, `--no-wait`, `--record FILE`. |
 | `send <name> [PROMPT]` | Queue a prompt; it runs after the current turn. Starts an owner and resumes the session when none runs. `--wait` prints the turn. |
 | `attach <name>` | Print new events (`--from-start`: the whole log) and send lines typed on stdin. `attach --project` follows every session of the project. |
 | `resume <name>` | Start an owner for a session nobody owns, after a crash or a reboot. |
@@ -75,13 +75,19 @@ way.
 | --- | --- | --- | --- |
 | `--effort low … max` | `effort` low … max | `reasoning_effort` low … max | none (a notice) |
 | `--permissions read-only` | mode `plan` | mode `read-only` | mode `#plan` |
-| `--permissions workspace` | mode `acceptEdits` | mode `workspace-write` | mode `#agent` |
+| `--permissions workspace` | mode `acceptEdits` and its OS sandbox | mode `workspace-write` | mode `#agent` |
 | `--permissions full` | mode `bypassPermissions` | mode `agent-full-access` | mode `#autopilot` |
 
 `--model` is passed as the agent lists it; a model the agent doesn't list is refused with the valid ones. An effort
 or mode the agent doesn't offer is a `notice` event, not an error. Permission requests the agent still sends follow
 `--on-permission`: `deny`, `allow-reads`, `allow` or `ask` (wait for `answer`). The default is `allow-reads` for
 read-only and `allow` otherwise, since the mode already limits what the agent asks for.
+
+Rules decide a request before the policy: `--deny-command "git push"` refuses a command line that runs it (also after
+`&&`, `;` or `|`), `--deny-tool` and `--allow-tool` match the agent's tool name (Claude's `toolName`, else the title;
+`mcp__lotar__*` matches a prefix), and `--confine-writes` refuses edits outside the working directory and `--add-dir`.
+Claude also gets the tool lists and denied commands as its own `allowedTools` and `disallowedTools` (`Bash(git
+push:*)`), since its sandboxed shell commands don't ask. In the library they are `Profile::rules`.
 
 ## Agents
 

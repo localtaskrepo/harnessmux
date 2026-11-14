@@ -10,7 +10,9 @@ use harnessmux::client::{self, DEFAULT_IDLE_TTL};
 use harnessmux::follow::Follower;
 use harnessmux::ipc::{self, Request};
 use harnessmux::profile::parse_mcp_file;
-use harnessmux::{AgentTable, Error, Event, EventBody, Profile, Registry, Result, Session, SessionState, StartOptions, capabilities, event, mcp, replay};
+use harnessmux::{
+    AgentTable, Error, Event, EventBody, Profile, Registry, Result, Rules, Session, SessionState, StartOptions, capabilities, event, mcp, replay,
+};
 use tokio::io::AsyncBufReadExt as _;
 
 use super::{Command, ProjectArg, PromptArgs};
@@ -40,6 +42,18 @@ pub struct RunArgs {
     /// allow-reads for read-only, allow otherwise.
     #[arg(long)]
     on_permission: Option<String>,
+    /// Refuse a shell command, e.g. "git push" (repeatable).
+    #[arg(long = "deny-command", value_name = "COMMAND")]
+    deny_commands: Vec<String>,
+    /// Allow a tool by the agent's name for it without the policy; a trailing * matches a prefix (repeatable).
+    #[arg(long = "allow-tool", value_name = "TOOL")]
+    allow_tools: Vec<String>,
+    /// Refuse a tool, matched like --allow-tool (repeatable).
+    #[arg(long = "deny-tool", value_name = "TOOL")]
+    deny_tools: Vec<String>,
+    /// Refuse edits outside the working directory and --add-dir directories.
+    #[arg(long)]
+    confine_writes: bool,
     /// Another config option of the agent, as id=value (repeatable).
     #[arg(long = "option", value_name = "ID=VALUE")]
     options: Vec<String>,
@@ -108,6 +122,12 @@ fn profile(args: &RunArgs) -> Result<Profile> {
         effort: args.effort.as_deref().map(str::parse).transpose()?,
         permissions: args.permissions.as_deref().map(str::parse).transpose()?.unwrap_or_default(),
         on_permission: args.on_permission.as_deref().map(str::parse).transpose()?,
+        rules: Rules {
+            deny_commands: args.deny_commands.clone(),
+            allow_tools: args.allow_tools.clone(),
+            deny_tools: args.deny_tools.clone(),
+            confine_writes: args.confine_writes,
+        },
         options: pairs(&args.options, "--option")?,
         env: pairs(&args.env, "--env")?,
         provider: args.provider.clone(),

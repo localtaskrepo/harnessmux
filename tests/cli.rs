@@ -231,6 +231,16 @@ modes = { workspace = "acceptEdits" }"#,
 }
 
 #[test]
+fn a_rule_refuses_a_request_the_policy_would_allow() {
+    let home = home(&[("rec", "permission-then-error.jsonl", "options = { mode = \"mode\" }\nmodes = { workspace = \"acceptEdits\" }")]);
+    let run = home.run(&["run", "rec", "--name", "r", "--deny-tool", "Edit *", "Fix add()"]);
+    assert!(run.status.success(), "{}", text(&run));
+    let answered = home.events("r").into_iter().find(|e| e["type"] == "permission.answered").unwrap();
+    assert_eq!(answered["option"], "reject", "{answered}");
+    assert_eq!(answered["by"], "rule deny_tools Edit *", "{answered}");
+}
+
+#[test]
 fn list_filters_by_project_and_bad_input_names_the_valid_values() {
     let home = home(&[("claude", "claude-two-turns.jsonl", CLAUDE)]);
     let bad = home.run(&["run", "claude", "--effort", "ultra", "x"]);

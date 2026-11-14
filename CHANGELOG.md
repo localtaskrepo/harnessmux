@@ -8,6 +8,9 @@
 - A t3 session resumed after its owner died during a turn follows the thread's run to its end in its first turn
   instead of sending another prompt.
 - A t3 turn reports the replies of a finished run (the thread's `activeRunId` is null then).
+- Claude's workspace sessions run in its OS sandbox again (`meta` in agents.toml, sent as the session's `_meta`).
+- Permission rules (`Profile::rules`, `--deny-command`, `--allow-tool`, `--deny-tool`, `--confine-writes`) decide
+  requests before the policy; Claude also gets them as its own tool lists (`rules_meta`).
 
 ## 0.1.1 (2026-11-13)
 
