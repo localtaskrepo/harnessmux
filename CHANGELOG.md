@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 (2026-11-13)
 
 - A session whose agent fails to start no longer leaves its socket file behind.
 
