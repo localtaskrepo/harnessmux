@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.4 (2026-11-14)
+
+- `deny_commands` also matches a command with the program's options before the subcommand (`git -C dir push`,
+  `git -c a=b push`), a program path, `env`/`sudo` wrappers and `sh -c "…"`.
+- Claude's workspace sandbox no longer runs shell commands without asking and no longer allows unsandboxed retries,
+  so the rules see every command.
+
 ## 0.1.3 (2026-11-14)
 
 - A t3 turn whose `t3` exits with an error while the thread still runs, or because the T3 Code server doesn't answer,

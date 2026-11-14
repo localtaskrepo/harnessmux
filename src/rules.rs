@@ -64,16 +64,68 @@ fn matches(pattern: &str, name: &str) -> bool {
     }
 }
 
-/// Whether one of the commands in `line` starts with the words of `denied`.
+/// Whether one of the commands in `line` runs `denied`: its program (by file name, after variable assignments and
+/// wrappers such as `env` or `sudo`), then its other words with the program's options skipped, so `git -C . push` and
+/// `git -c a=b push` run `git push`. Commands in `sh -c "…"` and `$(…)` count too.
 fn runs(line: &str, denied: &str) -> bool {
     let denied: Vec<&str> = denied.split_whitespace().collect();
-    if denied.is_empty() {
+    let Some((program, rest)) = denied.split_first() else { return false };
+    line.split(['&', '|', ';', '\n', '(', ')', '`']).any(|part| {
+        let words: Vec<&str> = part.split_whitespace().map(|word| word.trim_matches(['"', '\''])).filter(|word| !word.is_empty()).collect();
+        command_runs(&words, program, rest)
+    })
+}
+
+/// Options that take the next word as their value (git's global options), skipped with it.
+const VALUE_OPTIONS: &[&str] = &["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env", "--super-prefix"];
+const WRAPPERS: &[&str] = &["env", "command", "exec", "nohup", "sudo", "time", "nice", "xargs"];
+const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "fish"];
+
+fn command_runs(words: &[&str], program: &str, rest: &[&str]) -> bool {
+    let name = |word: &str| {
+        let file = word.rsplit(['/', '\\']).next().unwrap_or(word);
+        file.strip_suffix(".exe").unwrap_or(file).to_string()
+    };
+    let mut at = 0;
+    // Variable assignments, wrappers and the wrappers' options.
+    while let Some(word) = words.get(at) {
+        let wrapper = WRAPPERS.contains(&name(word).as_str());
+        if (word.contains('=') && !word.starts_with('-')) || wrapper || (at > 0 && word.starts_with('-') && WRAPPERS.contains(&name(words[at - 1]).as_str())) {
+            at += 1;
+            if name(word) == "sudo" && words.get(at).is_some_and(|next| *next == "-u") {
+                at += 2;
+            }
+        } else {
+            break;
+        }
+    }
+    let Some(first) = words.get(at) else { return false };
+    let first = name(first);
+    if SHELLS.contains(&first.as_str()) && words.get(at + 1).is_some_and(|flag| flag.starts_with('-') && flag.contains('c')) {
+        return command_runs(&words[at + 2..], program, rest);
+    }
+    if first != program {
         return false;
     }
-    line.split(['&', '|', ';', '\n', '(', ')']).any(|part| {
-        let words: Vec<&str> = part.split_whitespace().skip_while(|word| word.contains('=') && !word.starts_with('-')).collect();
-        words.len() >= denied.len() && words[..denied.len()] == denied[..]
-    })
+    let mut args = words[at + 1..].iter();
+    let mut expected = rest.iter();
+    let Some(mut want) = expected.next() else { return true };
+    while let Some(word) = args.next() {
+        if word.starts_with('-') {
+            if VALUE_OPTIONS.contains(word) {
+                args.next();
+            }
+            continue;
+        }
+        if word != want {
+            return false;
+        }
+        match expected.next() {
+            Some(next) => want = next,
+            None => return true,
+        }
+    }
+    false
 }
 
 /// The shell command line of an execute request: `rawInput.command` (a string or an argument list).
@@ -145,7 +197,20 @@ mod tests {
         for line in ["git push", "git push origin main", "cd x && git push", "FOO=1 git push -f", "make; git   push"] {
             assert_eq!(rules().decide(&bash(line), &roots).map(|(allow, _)| allow), Some(false), "{line}");
         }
-        for line in ["git pushd", "echo git push", "git status"] {
+        for line in [
+            "git -C . push",
+            "git -c credential.helper= push origin",
+            "git --git-dir=.git --work-tree . push",
+            "/usr/bin/git push",
+            "env GIT_TRACE=1 git push",
+            "sudo -u me git push",
+            "sh -c 'git push origin main'",
+            "bash -lc \"cd x && git -C y push\"",
+            "echo $(git push)",
+        ] {
+            assert_eq!(rules().decide(&bash(line), &roots).map(|(allow, _)| allow), Some(false), "{line}");
+        }
+        for line in ["git pushd", "echo git push", "git status", "git -C push status", "git log --grep push"] {
             assert_eq!(rules().decide(&bash(line), &roots), None, "{line}");
         }
         let args = json!({"toolCall": {"kind": "execute", "rawInput": {"command": ["git", "push"]}}});

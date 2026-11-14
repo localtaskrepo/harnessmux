@@ -84,10 +84,11 @@ or mode the agent doesn't offer is a `notice` event, not an error. Permission re
 read-only and `allow` otherwise, since the mode already limits what the agent asks for.
 
 Rules decide a request before the policy: `--deny-command "git push"` refuses a command line that runs it (also after
-`&&`, `;` or `|`), `--deny-tool` and `--allow-tool` match the agent's tool name (Claude's `toolName`, else the title;
+`&&`, `;`, `|`, in `sh -c "…"`, with the program's options in between such as `git -C dir -c a=b push`, or through
+`env` or `sudo`), `--deny-tool` and `--allow-tool` match the agent's tool name (Claude's `toolName`, else the title;
 `mcp__lotar__*` matches a prefix), and `--confine-writes` refuses edits outside the working directory and `--add-dir`.
-Claude also gets the tool lists and denied commands as its own `allowedTools` and `disallowedTools` (`Bash(git
-push:*)`), since its sandboxed shell commands don't ask. In the library they are `Profile::rules`.
+At workspace, Claude's shell commands run in its OS sandbox and still ask, so the rules see each one; Claude also gets
+the tool lists and denied commands as its own `allowedTools` and `disallowedTools` (`Bash(git push:*)`). In the library they are `Profile::rules`.
 
 ## Agents
 

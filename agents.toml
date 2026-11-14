@@ -26,8 +26,9 @@ live = true
 options = { model = "model", effort = "effort", mode = "mode" }
 effort = { low = "low", medium = "medium", high = "high", xhigh = "xhigh", max = "max" }
 modes = { read-only = "plan", workspace = "acceptEdits", full = "bypassPermissions" }
-# Claude's OS sandbox: shell commands run without asking but can't write outside the session's directories.
-meta = { workspace = { claudeCode = { options = { settings = { sandbox = { enabled = true, autoAllowBashIfSandboxed = true } } } } } }
+# Claude's OS sandbox: shell commands can't write outside the session's directories and can't leave the sandbox. They
+# still ask, so harnessmux's rules see each one (deny_commands such as git push).
+meta = { workspace = { claudeCode = { options = { settings = { sandbox = { enabled = true, autoAllowBashIfSandboxed = false, allowUnsandboxedCommands = false } } } } } }
 rules_meta = { allow_tools = "claudeCode.options.allowedTools", deny_tools = "claudeCode.options.disallowedTools", command = "Bash({}:*)" }
 
 [agents.codex]
