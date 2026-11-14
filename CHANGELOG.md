@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.2 (2026-11-14)
+
+- `session.started` has the agent session's `link` (a T3 Code thread's).
+- A turn that waits for an answer in the agent's own app ends with stop reason `waiting_for_answer` (CLI exit code 3);
+  a t3 thread waiting for an answer does this instead of failing the turn.
+- A t3 session resumed after its owner died during a turn follows the thread's run to its end in its first turn
+  instead of sending another prompt.
+- A t3 turn reports the replies of a finished run (the thread's `activeRunId` is null then).
+
 ## 0.1.1 (2026-11-13)
 
 - A session whose agent fails to start no longer leaves its socket file behind.

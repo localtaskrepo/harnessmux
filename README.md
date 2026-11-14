@@ -51,7 +51,8 @@ harnessmux close fix-calc
 | `mcp` | An MCP server on stdio with tools to start, send to, wait for, cancel and close child sessions. |
 | `replay FILE` | An ACP agent that plays back a recording made with `run --record`, for tests. |
 
-`--json` prints the event stream. The exit code is 0 for a finished turn, 1 for a failed one, 2 for a cancelled one;
+`--json` prints the event stream. The exit code is 0 for a finished turn, 1 for a failed one, 2 for a cancelled one, 3 for one
+that waits for an answer in the agent's own app;
 64 for wrong input, 69 when the agent can't be started, 74 for file and socket errors.
 
 ## Sessions
@@ -118,7 +119,10 @@ Some adapters send a failed model call as an ordinary reply that ends the turn. 
 text (`model_not_found`, an auth failure, `Error: Execution failed: …`) ends the turn as `turn.failed`.
 
 T3 Code's CLI has no effort setting, no child threads, no interrupt and no permission answers: `capabilities t3`
-says so, and `cancel` stops waiting while the thread keeps running in T3 Code. A t3 session needs `--provider` with
+says so, and `cancel` stops waiting while the thread keeps running in T3 Code. A thread that waits for an answer ends
+the turn with `waiting_for_answer` and a notice with the thread's link. When a session's owner died during a turn,
+the first turn after the resume follows the thread's run to its end instead of sending its prompt, so the agent
+doesn't work twice. A t3 session needs `--provider` with
 `--model` (`--provider claudeAgent --model claude-haiku-5-5`), starts its thread in the session's project and can
 start it in a new worktree (`--worktree main --branch agent/x`).
 
@@ -129,7 +133,7 @@ turn, `turn`; `raw` keeps the agent's own message it came from.
 
 | type | fields |
 | --- | --- |
-| `session.started` | `agent`, `cwd`, `agent_session`, `how` (new, resumed, loaded), `adapter` |
+| `session.started` | `agent`, `cwd`, `agent_session`, `how` (new, resumed, loaded), `adapter`, `link` (a T3 Code thread's) |
 | `turn.started` | `prompt` |
 | `message.delta`, `thought.delta` | `text` |
 | `message` | `text`: the whole reply of the turn, before it ends |
@@ -140,7 +144,7 @@ turn, `turn`; `raw` keeps the agent's own message it came from.
 | `usage` | `context_used`, `context_size`, `cost_usd` |
 | `config.changed` | `option`, `value` |
 | `notice` | `text` |
-| `turn.finished` | `stop_reason` (end_turn, max_tokens, max_turn_requests, refusal, cancelled), `usage` |
+| `turn.finished` | `stop_reason` (end_turn, max_tokens, max_turn_requests, refusal, cancelled, waiting_for_answer), `usage` |
 | `turn.failed` | `error` |
 | `session.ended` | `reason` (closed, idle, or the error) |
 

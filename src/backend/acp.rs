@@ -296,6 +296,7 @@ impl Driver {
                 agent_session: Some(id.clone()),
                 how: how.into(),
                 adapter,
+                link: None,
             },
             Some(response.clone()),
         );

@@ -119,6 +119,7 @@ impl Session {
     async fn own(registry: Registry, table: &AgentTable, mut record: SessionRecord, resume: bool, idle_ttl: Option<Duration>) -> Result<Self> {
         let spec = table.get(&record.agent)?.clone();
         let mut listener = ipc::listen(&registry, &record.name).await?;
+        let interrupted = resume && matches!(record.state, SessionState::Running | SessionState::Waiting);
         record.owner_pid = Some(std::process::id());
         record.state = SessionState::Idle;
         registry.save(&record)?;
@@ -130,7 +131,7 @@ impl Session {
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (report_tx, mut report_rx) = mpsc::unbounded_channel();
-        let start = backend::Start { spec, record: record.clone(), resume };
+        let start = backend::Start { spec, record: record.clone(), resume, interrupted };
         let mut driver = tokio::spawn(backend::run(start, command_rx, Reporter::new(report_tx)));
 
         let mut owner = Owner {

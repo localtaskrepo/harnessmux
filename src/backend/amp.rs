@@ -31,6 +31,7 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
             agent_session: thread.clone(),
             how: if thread.is_some() { "resumed".into() } else { "new".into() },
             adapter: None,
+            link: None,
         },
         None,
     );

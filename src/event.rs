@@ -73,12 +73,19 @@ pub enum StopReason {
     MaxTurnRequests,
     Refusal,
     Cancelled,
+    /// The agent stopped to wait for an answer the caller can't give through harnessmux (a T3 Code thread's
+    /// question); the agent's own session takes it.
+    WaitingForAnswer,
 }
 
 impl StopReason {
-    /// The CLI's exit code for a turn that ended this way: 0, or 2 when cancelled.
+    /// The CLI's exit code for a turn that ended this way: 0, 2 when cancelled, 3 when it waits for an answer.
     pub fn exit_code(self) -> u8 {
-        if self == Self::Cancelled { 2 } else { 0 }
+        match self {
+            Self::Cancelled => 2,
+            Self::WaitingForAnswer => 3,
+            _ => 0,
+        }
     }
 }
 
@@ -96,6 +103,9 @@ pub enum EventBody {
         how: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         adapter: Option<String>,
+        /// Where a person opens the agent's session (a T3 Code thread's link).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link: Option<String>,
     },
     #[serde(rename = "turn.started")]
     TurnStarted { prompt: String },

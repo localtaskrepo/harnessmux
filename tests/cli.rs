@@ -318,3 +318,86 @@ fn start_errors_reach_the_caller_and_leave_no_session() {
     let socket = harnessmux::Registry::new(home.dir.path().join("state")).socket_name("g");
     assert!(cfg!(windows) || !Path::new(&socket).exists(), "{socket} left behind");
 }
+
+/// A fake `t3` CLI in `dir`: `thread start` names thread t1 and exits with the code in `start-exit`, `thread send`
+/// hangs, `thread show` prints `show.json`; every call is appended to `calls`.
+#[cfg(unix)]
+fn fake_t3(home: &Home) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = home.dir.path().join("t3");
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("t3");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+echo "$1 $2" >> "$dir/calls"
+case "$1 $2" in
+  "thread start") cat > /dev/null; echo "Thread t1" >&2; echo "Started."; exit "$(cat "$dir/start-exit")" ;;
+  "thread send") cat > /dev/null; exec sleep 20 ;;
+  "thread show") cat "$dir/show.json" ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        home.dir.path().join("config/agents.toml"),
+        format!("[agents.t3]\nkind = \"t3\"\ncommand = [{:?}]\nlive = false\n", script.display().to_string()),
+    )
+    .unwrap();
+    dir
+}
+
+#[cfg(unix)]
+fn show(dir: &Path, status: &str, active: &str, pending: u64, messages: &str) {
+    let json = format!(
+        r#"{{"thread":{{"threadId":"t1","link":"https://t3/t1","status":"{status}","activeRunId":{active},"latestRunId":"r2","pendingRequestCount":{pending}}},"messages":{messages}}}"#
+    );
+    std::fs::write(dir.join("show.json"), json).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_t3_thread_waiting_for_an_answer_ends_the_turn_with_its_link() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    std::fs::write(dir.join("start-exit"), "2").unwrap();
+    show(&dir, "running", "\"r1\"", 1, "[]");
+    let run = home.run(&["run", "t3", "--name", "w", "--provider", "claudeAgent", "--model", "m", "Fix it"]);
+    assert_eq!(run.status.code(), Some(3), "{}", text(&run));
+    let events = home.events("w");
+    let started = events.iter().find(|e| e["type"] == "session.started").unwrap();
+    assert_eq!(started["link"], "https://t3/t1", "{started}");
+    let end = events.iter().find(|e| e["type"] == "turn.finished").unwrap();
+    assert_eq!(end["stop_reason"], "waiting_for_answer", "{end}");
+    assert!(events.iter().any(|e| e["type"] == "notice" && e["text"].as_str().unwrap().contains("waits for an answer; answer it in T3 Code: https://t3/t1")));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_t3_session_whose_owner_died_mid_turn_follows_the_thread_run_instead_of_sending_again() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    std::fs::write(dir.join("start-exit"), "0").unwrap();
+    show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r1","text":"Started."}]"#);
+    let first = home.run(&["run", "t3", "--name", "k", "--provider", "claudeAgent", "--model", "m", "Start"]);
+    assert!(first.status.success(), "{}", text(&first));
+
+    // The second turn's `thread send` hangs; the owner dies during it.
+    show(&dir, "running", "\"r2\"", 0, r#"[{"role":"assistant","runId":"r2","text":"Working."}]"#);
+    let turn = home.run(&["send", "k", "Go on"]);
+    assert!(turn.status.success(), "{}", text(&turn));
+    home.wait_for("k", "message.delta");
+    let status: Value = serde_json::from_slice(&home.run(&["status", "k", "--json"]).stdout).unwrap();
+    let pid = status["owner_pid"].as_u64().unwrap().to_string();
+    assert!(std::process::Command::new("kill").args(["-9", &pid]).status().unwrap().success());
+
+    // The thread ended its run meanwhile: the resumed session reports it and sends nothing.
+    show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r2","text":"Working."},{"role":"assistant","runId":"r2","text":"Finished."}]"#);
+    let resumed = home.run(&["send", "k", "--wait", "Continue"]);
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    assert!(String::from_utf8_lossy(&resumed.stdout).contains("Finished."), "{}", text(&resumed));
+    let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+    assert_eq!(calls.lines().filter(|call| *call == "thread send").count(), 1, "{calls}");
+}

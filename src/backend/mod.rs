@@ -71,6 +71,8 @@ pub struct Start {
     pub spec: AgentSpec,
     pub record: SessionRecord,
     pub resume: bool,
+    /// The previous owner stopped during a turn (the record was left running or waiting).
+    pub interrupted: bool,
 }
 
 /// Runs the driver until the session closes or the agent goes away.
