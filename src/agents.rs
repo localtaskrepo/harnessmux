@@ -245,6 +245,19 @@ impl AgentTable {
         Ok(Self { agents })
     }
 
+    /// Adds an agent or replaces the one of the same name, such as a copy of a built-in agent with another command. A
+    /// command of one's own replaces the pinned adapter only when the caller clears `adapter`, as in `agents.toml`.
+    pub fn insert(&mut self, spec: AgentSpec) -> Result<()> {
+        if spec.name.is_empty() {
+            return Err(Error::Invalid("an agent needs a name".into()));
+        }
+        if spec.command.is_empty() {
+            return Err(Error::Invalid(format!("agent {} needs a command", spec.name)));
+        }
+        self.agents.insert(spec.name.clone(), spec);
+        Ok(())
+    }
+
     pub fn get(&self, name: &str) -> Result<&AgentSpec> {
         self.agents.get(name).ok_or_else(|| Error::Invalid(format!("unknown agent {name}; known agents: {}", self.names().join(", "))))
     }
@@ -311,6 +324,28 @@ command = ["my-agent", "--acp"]
         let full = Value::Object(claude.session_meta(Permissions::Full, &Rules::default()).unwrap_or_default());
         assert_eq!(full.get("claudeCode"), None, "full permissions run unsandboxed");
         assert_eq!(table.get("codex").unwrap().session_meta(Permissions::Workspace, &rules), None);
+    }
+
+    #[test]
+    fn insert_adds_or_replaces_one_agent() {
+        let mut table = AgentTable::parse(BUILTIN, None).unwrap();
+        let mut claude = table.get("claude").unwrap().clone();
+        claude.command = vec!["/opt/claude-agent-acp".into(), "--debug".into()];
+        claude.adapter = None;
+        table.insert(claude).unwrap();
+        let claude = table.get("claude").unwrap();
+        assert_eq!(claude.command, ["/opt/claude-agent-acp", "--debug"]);
+        assert_eq!(claude.adapter, None);
+        assert_eq!(claude.options.effort.as_deref(), Some("effort"), "the other keys stay");
+
+        let mut mine = table.get("codex").unwrap().clone();
+        mine.name = "mine".into();
+        table.insert(mine.clone()).unwrap();
+        assert!(table.names().contains(&"mine"));
+
+        mine.command.clear();
+        let err = table.insert(mine).unwrap_err().to_string();
+        assert!(err.contains("agent mine needs a command"), "{err}");
     }
 
     #[test]

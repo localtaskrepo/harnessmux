@@ -173,7 +173,8 @@ let turn = session.send("Fix the failing test").await?;
 ```
 
 `Session::resume` takes over a session after a restart; `cancel`, `answer`, `set`, `status` and `close` do what the
-CLI commands do. `harnessmux::client` reaches sessions another process owns.
+CLI commands do. `harnessmux::client` reaches sessions another process owns. `AgentTable::insert` adds an agent or
+replaces one, for example a copy of `claude` with another `command` (clear its `adapter` so the command runs).
 
 ## Recordings and tests
 

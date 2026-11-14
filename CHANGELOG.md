@@ -11,6 +11,7 @@
 - Claude's workspace sessions run in its OS sandbox again (`meta` in agents.toml, sent as the session's `_meta`).
 - Permission rules (`Profile::rules`, `--deny-command`, `--allow-tool`, `--deny-tool`, `--confine-writes`) decide
   requests before the policy; Claude also gets them as its own tool lists (`rules_meta`).
+- `AgentTable::insert` adds an agent or replaces one, such as a built-in agent with another command (lotar DEV-512).
 
 ## 0.1.1 (2026-11-13)
 
