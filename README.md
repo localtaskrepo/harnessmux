@@ -94,6 +94,8 @@ push:*)`), since its sandboxed shell commands don't ask. In the library they are
 The agent table, [`agents.toml`](agents.toml), says how each agent starts, the pinned adapter version and the ids of
 its options. It is read at run time; a file `~/.config/harnessmux/agents.toml` (`%APPDATA%\harnessmux` on Windows)
 overrides single keys per agent or adds agents. A `command` of your own replaces the pinned adapter.
+Agents marked `live = false` are set up from their docs; [docs/agent-cli-research.md](docs/agent-cli-research.md) collects
+what those docs say about each CLI's headless mode.
 
 ```toml
 [agents.codex]
