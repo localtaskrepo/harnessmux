@@ -315,4 +315,6 @@ fn start_errors_reach_the_caller_and_leave_no_session() {
     assert!(String::from_utf8_lossy(&missing.stderr).contains("not installed or not on PATH. Install no-such-agent-cli"), "{}", text(&missing));
     let sessions: Vec<Value> = serde_json::from_slice(&home.run(&["list", "--json"]).stdout).unwrap();
     assert!(sessions.is_empty(), "{sessions:?}");
+    let socket = harnessmux::Registry::new(home.dir.path().join("state")).socket_name("g");
+    assert!(cfg!(windows) || !Path::new(&socket).exists(), "{socket} left behind");
 }

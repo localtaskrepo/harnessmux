@@ -167,6 +167,10 @@ impl Session {
                     owner.emit(None, EventBody::SessionEnded { reason: error.to_string() }, None);
                     owner.record.owner_pid = None;
                     owner.save();
+                    drop(listener);
+                    if !cfg!(windows) {
+                        let _ = std::fs::remove_file(owner.registry.socket_name(&owner.record.name));
+                    }
                     return Err(error);
                 }
             }
