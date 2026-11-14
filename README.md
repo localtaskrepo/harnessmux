@@ -179,7 +179,8 @@ cargo fmt --all --check
 cargo deny check
 ```
 
-CI runs the tests on Linux, macOS and Windows. A tag `v*` builds the release binaries.
+CI runs the tests on Linux, macOS and Windows. A tag `v*` builds the release binaries and publishes the crate to
+crates.io (trusted publishing, no stored token).
 
 ## License
 

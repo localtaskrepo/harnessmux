@@ -10,8 +10,9 @@ its design: lotar `docs/developers/harness-tool-design.md`.
   `cargo deny check`. One test: `cargo nextest run <name>`.
 - Live check of an agent (spends its quota): `HARNESSMUX_HOME=$(mktemp -d) harnessmux run <agent> --record
   /tmp/x.jsonl "Reply with exactly the word: pong"`.
-- Release: bump `version` in Cargo.toml and CHANGELOG.md, tag `vX.Y.Z`, push the tag (release.yml builds the
-  binaries); `cargo publish` for the crate.
+- Release: bump `version` in Cargo.toml and CHANGELOG.md, commit, tag `vX.Y.Z` (signed), push the tag. release.yml
+  builds the binaries, makes the GitHub release and publishes the crate through crates.io trusted publishing
+  (environment `release`, v* tags only); no token is stored.
 
 ## Differences from the global standards
 - Hooks: none in the repo (public, self-contained); CI runs fmt, clippy, nextest on Linux, macOS and Windows, deny.

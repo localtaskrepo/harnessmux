@@ -1,4 +1,5 @@
-# Release from a v* tag: CI, then static binaries per platform, then one GitHub release with checksums.
+# Release from a v* tag: CI, then static binaries per platform, then one GitHub release with checksums, then the
+# crate on crates.io.
 # Set BIN_NAME. The tag must match the version in Cargo.toml.
 name: Release
 
@@ -75,3 +76,21 @@ jobs:
           files: out/*
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
+
+  # The crate, through crates.io trusted publishing: a short-lived token for this workflow in the release environment
+  # (v* tags only), no stored secret. After the binaries, so a failed publish leaves the GitHub release in place.
+  publish:
+    needs: release
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
