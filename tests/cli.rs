@@ -330,7 +330,8 @@ fn start_errors_reach_the_caller_and_leave_no_session() {
 }
 
 /// A fake `t3` CLI in `dir`: `thread start` names thread t1, prints `start-error` (if any) to stderr and exits with
-/// the code in `start-exit`, `thread send` hangs, `thread show` prints `show.json`; every call is appended to `calls`.
+/// the code in `start-exit` after `start-sleep` seconds, `thread send` hangs, `thread show` prints `show.json`,
+/// `thread list` prints `list.json` (or fails while `list-fail` exists); every call is appended to `calls`.
 /// While `down` holds a number above 0, `thread show` counts it down and fails as T3's CLI does when its server is down.
 #[cfg(unix)]
 fn fake_t3(home: &Home) -> PathBuf {
@@ -346,7 +347,9 @@ echo "$1 $2" >> "$dir/calls"
 case "$1 $2" in
   "thread start") cat > /dev/null; echo "Thread t1" >&2; cat "$dir/start-error" >&2 2>/dev/null; sleep "$(cat "$dir/start-sleep" 2>/dev/null || echo 0)"; echo "Started."; exit "$(cat "$dir/start-exit")" ;;
   "thread send") cat > /dev/null; exec sleep 20 ;;
-  "thread list") cat "$dir/list.json" ;;
+  "thread list")
+    if [ -f "$dir/list-fail" ]; then echo "Could not reach the T3 Code server at http://127.0.0.1:3773" >&2; exit 1; fi
+    cat "$dir/list.json" ;;
   "thread show")
     down=$(cat "$dir/down" 2>/dev/null || echo 0)
     if [ "$down" -gt 0 ]; then
@@ -442,14 +445,13 @@ fn a_t3_session_whose_owner_died_mid_turn_follows_the_thread_run_instead_of_send
     assert_eq!(calls.lines().filter(|call| *call == "thread send").count(), 1, "{calls}");
 }
 
+/// Session `n` with title "DEV-1 Fix" whose owner died in its first turn after `thread start` made t1 and before it
+/// saved t1's id; `list.json` lists t1 as made in that turn. Returns the record's path.
 #[cfg(unix)]
-#[test]
-fn a_t3_session_whose_owner_died_before_it_saved_the_thread_finds_the_thread_by_its_title() {
-    let home = home(&[]);
-    let dir = fake_t3(&home);
+fn owner_died_before_it_saved_the_thread(home: &Home, dir: &Path) -> PathBuf {
     std::fs::write(dir.join("start-exit"), "0").unwrap();
     std::fs::write(dir.join("start-sleep"), "20").unwrap();
-    show(&dir, "running", "\"r2\"", 0, r#"[{"role":"assistant","runId":"r2","text":"Working."}]"#);
+    show(dir, "running", "\"r2\"", 0, r#"[{"role":"assistant","runId":"r2","text":"Working."}]"#);
     let turn = home.run(&["run", "t3", "--name", "n", "--provider", "claudeAgent", "--model", "m", "--title", "DEV-1 Fix", "--no-wait", "Start"]);
     assert!(turn.status.success(), "{}", text(&turn));
     home.wait_for("n", "session.started");
@@ -457,7 +459,6 @@ fn a_t3_session_whose_owner_died_before_it_saved_the_thread_finds_the_thread_by_
     let pid = status["owner_pid"].as_u64().unwrap().to_string();
     assert!(std::process::Command::new("kill").args(["-9", &pid]).status().unwrap().success());
 
-    // As if the owner died after `thread start` made t1 and before it saved t1's id.
     let path = home.dir.path().join("state/sessions/n.json");
     let mut record: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(record["agent_session"], "t1");
@@ -469,6 +470,15 @@ fn a_t3_session_whose_owner_died_before_it_saved_the_thread_finds_the_thread_by_
         r#"[{{"threadId":"t0","title":"DEV-1 Fix","createdAt":"2000-01-01T00:00:00.000Z"}},{{"threadId":"t1","title":"DEV-1 Fix","createdAt":"{since}"}}]"#
     );
     std::fs::write(dir.join("list.json"), list).unwrap();
+    path
+}
+
+#[cfg(unix)]
+#[test]
+fn a_t3_session_whose_owner_died_before_it_saved_the_thread_finds_the_thread_by_its_title() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    let path = owner_died_before_it_saved_the_thread(&home, &dir);
 
     show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r2","text":"Finished."}]"#);
     let resumed = home.run(&["send", "n", "--wait", "Continue"]);
@@ -479,4 +489,25 @@ fn a_t3_session_whose_owner_died_before_it_saved_the_thread_finds_the_thread_by_
     assert!(calls.lines().all(|call| call != "thread send"), "{calls}");
     let record: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(record["agent_session"], "t1");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_t3_session_that_cant_look_up_the_interrupted_turns_thread_starts_no_second_one() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    owner_died_before_it_saved_the_thread(&home, &dir);
+    std::fs::write(dir.join("list-fail"), "").unwrap();
+
+    for prompt in ["Continue", "And again"] {
+        let resumed = home.run(&["send", "n", "--wait", prompt]);
+        assert_eq!(resumed.status.code(), Some(1), "{}", text(&resumed));
+    }
+    let failed: Vec<Value> = home.events("n").into_iter().filter(|e| e["type"] == "turn.failed").collect();
+    assert_eq!(failed.len(), 2, "{failed:?}");
+    let error = failed[0]["error"].as_str().unwrap();
+    assert!(error.contains("can't tell whether that turn made a thread") && error.contains("Could not reach the T3 Code server"), "{error}");
+    let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+    assert_eq!(calls.lines().filter(|call| *call == "thread start").count(), 1, "{calls}");
+    assert_eq!(calls.lines().filter(|call| *call == "thread list").count(), 3, "retried: {calls}");
 }

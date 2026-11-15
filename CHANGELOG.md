@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.7 (2026-11-15)
+
+- A t3 session resumed after its owner died before it saved the thread's id no longer starts a thread when
+  `t3 thread list` can't be read (an error, a non-zero exit, output that isn't a list; three tries): it fails its turns
+  with the reason until it is resumed again, as a new thread could be a second one (lotar DEV-510).
+
 ## 0.1.6 (2026-11-15)
 
 - `deny_commands` reads the command line as a shell does instead of splitting it at spaces, so a quoted or escaped

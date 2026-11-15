@@ -2,7 +2,8 @@
 //! `t3 thread send <thread> - --wait`, with the prompt on stdin; `t3 thread show --json` is polled to follow the run.
 //! The thread lives in T3 Code, so a session resumes by sending to it again; when the previous owner stopped during a
 //! turn, the first turn after the resume follows the thread's run instead, as that turn may still run; when it died
-//! before it saved the new thread's id, the resume finds the thread by the session's title. A thread that
+//! before it saved the new thread's id, the resume finds the thread by the session's title; when that lookup fails, the
+//! session starts no thread and fails its turns until it is resumed again. A thread that
 //! waits for an answer ends the turn with `waiting_for_answer`. A `t3` that fails while the thread still runs, or
 //! because the T3 Code server doesn't answer, doesn't end the turn: it follows the thread's run, waiting for the server
 //! up to [`SERVER_WAIT`]. T3's CLI has no effort setting, no child threads, no permission answers and no interrupt.
@@ -38,16 +39,22 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
     let (program, base_args) = start.spec.launch_command().await?;
     reporter.report(Report::Ready);
     let mut thread = start.record.agent_session.clone();
-    if thread.is_none()
-        && start.interrupted
-        && let Some(id) = started_thread(&program, &start).await
-    {
-        reporter.report(Report::AgentSession { id: id.clone(), adapter: None });
-        reporter.notice(
-            None,
-            format!("The previous owner stopped before it saved the thread's id; T3 Code thread {id} has the session's title and was made in its turn"),
-        );
-        thread = Some(id);
+    // Why the session can't tell whether the interrupted turn made a thread: it then starts none, as that could be a
+    // second one.
+    let mut unresolved = None;
+    if thread.is_none() && start.interrupted {
+        match started_thread(&program, &start).await {
+            Lookup::Found(id) => {
+                reporter.report(Report::AgentSession { id: id.clone(), adapter: None });
+                reporter.notice(
+                    None,
+                    format!("The previous owner stopped before it saved the thread's id; T3 Code thread {id} has the session's title and was made in its turn"),
+                );
+                thread = Some(id);
+            }
+            Lookup::None => {}
+            Lookup::Failed(why) => unresolved = Some(why),
+        }
     }
     let mut follow = Follow::default();
     if let Some(id) = &thread {
@@ -68,6 +75,13 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
             }
         };
         reporter.event(Some(turn), EventBody::TurnStarted { prompt: text.clone() }, None);
+        if let Some(why) = &unresolved {
+            let error = format!(
+                "the previous owner stopped during a turn before it saved the T3 Code thread's id, and `t3 thread list` can't tell whether that turn made a thread ({why}); no thread is started, as it could be a second one. Resume the session once T3 Code answers"
+            );
+            reporter.event(Some(turn), EventBody::TurnFailed { error }, None);
+            continue;
+        }
         if std::mem::take(&mut interrupted)
             && let Some(id) = &thread
         {
@@ -338,24 +352,50 @@ async fn show(program: &std::path::Path, start: &Start, thread: &str) -> Shown {
     }
 }
 
+/// What `t3 thread list` says about the thread of the session's interrupted turn.
+enum Lookup {
+    Found(String),
+    /// The list has no such thread (or the session has no title to find it by): the turn made none.
+    None,
+    /// The list couldn't be read [`READ_ATTEMPTS`] times in a row; the reason.
+    Failed(String),
+}
+
 /// The thread `t3 thread start` made for the session's interrupted turn, from `t3 thread list --json`: the newest
-/// one with the session's title created since that turn began (`last_used`). None without a title.
-async fn started_thread(program: &std::path::Path, start: &Start) -> Option<String> {
-    let title = start.record.profile.title.as_deref()?;
+/// one with the session's title created since that turn began (`last_used`).
+async fn started_thread(program: &std::path::Path, start: &Start) -> Lookup {
+    let Some(title) = start.record.profile.title.as_deref() else { return Lookup::None };
     let project = start.record.project.clone().unwrap_or_else(|| start.record.cwd.clone());
-    let output = tokio::process::Command::new(program)
-        .args(["thread", "list", "--project"])
-        .arg(&project)
-        .arg("--json")
-        .envs(start.spec.env.iter().chain(&start.record.profile.env))
-        .current_dir(&start.record.cwd)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .await
-        .ok()?;
-    let threads = serde_json::from_slice(&output.stdout).ok()?;
-    thread_made_since(&threads, title, &start.record.last_used)
+    let mut why = String::new();
+    for attempt in 0..READ_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(POLL).await;
+        }
+        let output = tokio::process::Command::new(program)
+            .args(["thread", "list", "--project"])
+            .arg(&project)
+            .arg("--json")
+            .envs(start.spec.env.iter().chain(&start.record.profile.env))
+            .current_dir(&start.record.cwd)
+            .stdin(Stdio::null())
+            .output()
+            .await;
+        why = match output {
+            Err(error) => format!("starting {}: {error}", program.display()),
+            Ok(output) if !output.status.success() => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let line = stderr.lines().rev().find(|line| !is_noise(line) && !line.trim().is_empty()).unwrap_or_default().trim().to_string();
+                format!("t3 exited with {}{}", output.status, if line.is_empty() { String::new() } else { format!(": {line}") })
+            }
+            Ok(output) => match serde_json::from_slice::<Value>(&output.stdout) {
+                Ok(threads) if threads.is_array() => {
+                    return thread_made_since(&threads, title, &start.record.last_used).map_or(Lookup::None, Lookup::Found);
+                }
+                _ => "its output is not a JSON list of threads".to_string(),
+            },
+        };
+    }
+    Lookup::Failed(why)
 }
 
 fn thread_made_since(threads: &Value, title: &str, since: &str) -> Option<String> {
