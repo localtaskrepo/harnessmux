@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.5 (2026-11-15)
+
+- A t3 session whose owner died after `t3 thread start` made the thread and before the session saved its id resumes
+  with that thread (the newest with the session's title made since the turn began) and follows its run, instead of
+  starting a second thread (lotar DEV-510).
+
 ## 0.1.4 (2026-11-14)
 
 - `deny_commands` also matches a command with the program's options before the subcommand (`git -C dir push`,

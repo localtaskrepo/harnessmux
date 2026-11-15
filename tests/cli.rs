@@ -344,8 +344,9 @@ fn fake_t3(home: &Home) -> PathBuf {
 dir=$(dirname "$0")
 echo "$1 $2" >> "$dir/calls"
 case "$1 $2" in
-  "thread start") cat > /dev/null; echo "Thread t1" >&2; cat "$dir/start-error" >&2 2>/dev/null; echo "Started."; exit "$(cat "$dir/start-exit")" ;;
+  "thread start") cat > /dev/null; echo "Thread t1" >&2; cat "$dir/start-error" >&2 2>/dev/null; sleep "$(cat "$dir/start-sleep" 2>/dev/null || echo 0)"; echo "Started."; exit "$(cat "$dir/start-exit")" ;;
   "thread send") cat > /dev/null; exec sleep 20 ;;
+  "thread list") cat "$dir/list.json" ;;
   "thread show")
     down=$(cat "$dir/down" 2>/dev/null || echo 0)
     if [ "$down" -gt 0 ]; then
@@ -439,4 +440,43 @@ fn a_t3_session_whose_owner_died_mid_turn_follows_the_thread_run_instead_of_send
     assert!(String::from_utf8_lossy(&resumed.stdout).contains("Finished."), "{}", text(&resumed));
     let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
     assert_eq!(calls.lines().filter(|call| *call == "thread send").count(), 1, "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_t3_session_whose_owner_died_before_it_saved_the_thread_finds_the_thread_by_its_title() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    std::fs::write(dir.join("start-exit"), "0").unwrap();
+    std::fs::write(dir.join("start-sleep"), "20").unwrap();
+    show(&dir, "running", "\"r2\"", 0, r#"[{"role":"assistant","runId":"r2","text":"Working."}]"#);
+    let turn = home.run(&["run", "t3", "--name", "n", "--provider", "claudeAgent", "--model", "m", "--title", "DEV-1 Fix", "--no-wait", "Start"]);
+    assert!(turn.status.success(), "{}", text(&turn));
+    home.wait_for("n", "session.started");
+    let status: Value = serde_json::from_slice(&home.run(&["status", "n", "--json"]).stdout).unwrap();
+    let pid = status["owner_pid"].as_u64().unwrap().to_string();
+    assert!(std::process::Command::new("kill").args(["-9", &pid]).status().unwrap().success());
+
+    // As if the owner died after `thread start` made t1 and before it saved t1's id.
+    let path = home.dir.path().join("state/sessions/n.json");
+    let mut record: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(record["agent_session"], "t1");
+    assert_eq!(record["state"], "running");
+    record.as_object_mut().unwrap().remove("agent_session");
+    std::fs::write(&path, record.to_string()).unwrap();
+    let since = record["last_used"].as_str().unwrap().to_string();
+    let list = format!(
+        r#"[{{"threadId":"t0","title":"DEV-1 Fix","createdAt":"2000-01-01T00:00:00.000Z"}},{{"threadId":"t1","title":"DEV-1 Fix","createdAt":"{since}"}}]"#
+    );
+    std::fs::write(dir.join("list.json"), list).unwrap();
+
+    show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r2","text":"Finished."}]"#);
+    let resumed = home.run(&["send", "n", "--wait", "Continue"]);
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    assert!(String::from_utf8_lossy(&resumed.stdout).contains("Finished."), "{}", text(&resumed));
+    let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+    assert_eq!(calls.lines().filter(|call| *call == "thread start").count(), 1, "{calls}");
+    assert!(calls.lines().all(|call| call != "thread send"), "{calls}");
+    let record: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(record["agent_session"], "t1");
 }

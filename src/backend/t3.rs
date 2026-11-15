@@ -1,7 +1,8 @@
 //! T3 Code threads through T3's CLI: the first turn is `t3 thread start <project> - --wait`, later turns
 //! `t3 thread send <thread> - --wait`, with the prompt on stdin; `t3 thread show --json` is polled to follow the run.
 //! The thread lives in T3 Code, so a session resumes by sending to it again; when the previous owner stopped during a
-//! turn, the first turn after the resume follows the thread's run instead, as that turn may still run. A thread that
+//! turn, the first turn after the resume follows the thread's run instead, as that turn may still run; when it died
+//! before it saved the new thread's id, the resume finds the thread by the session's title. A thread that
 //! waits for an answer ends the turn with `waiting_for_answer`. A `t3` that fails while the thread still runs, or
 //! because the T3 Code server doesn't answer, doesn't end the turn: it follows the thread's run, waiting for the server
 //! up to [`SERVER_WAIT`]. T3's CLI has no effort setting, no child threads, no permission answers and no interrupt.
@@ -37,6 +38,17 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
     let (program, base_args) = start.spec.launch_command().await?;
     reporter.report(Report::Ready);
     let mut thread = start.record.agent_session.clone();
+    if thread.is_none()
+        && start.interrupted
+        && let Some(id) = started_thread(&program, &start).await
+    {
+        reporter.report(Report::AgentSession { id: id.clone(), adapter: None });
+        reporter.notice(
+            None,
+            format!("The previous owner stopped before it saved the thread's id; T3 Code thread {id} has the session's title and was made in its turn"),
+        );
+        thread = Some(id);
+    }
     let mut follow = Follow::default();
     if let Some(id) = &thread {
         if let Shown::Thread(shown) = show(&program, &start, id).await {
@@ -326,6 +338,38 @@ async fn show(program: &std::path::Path, start: &Start, thread: &str) -> Shown {
     }
 }
 
+/// The thread `t3 thread start` made for the session's interrupted turn, from `t3 thread list --json`: the newest
+/// one with the session's title created since that turn began (`last_used`). None without a title.
+async fn started_thread(program: &std::path::Path, start: &Start) -> Option<String> {
+    let title = start.record.profile.title.as_deref()?;
+    let project = start.record.project.clone().unwrap_or_else(|| start.record.cwd.clone());
+    let output = tokio::process::Command::new(program)
+        .args(["thread", "list", "--project"])
+        .arg(&project)
+        .arg("--json")
+        .envs(start.spec.env.iter().chain(&start.record.profile.env))
+        .current_dir(&start.record.cwd)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    let threads = serde_json::from_slice(&output.stdout).ok()?;
+    thread_made_since(&threads, title, &start.record.last_used)
+}
+
+fn thread_made_since(threads: &Value, title: &str, since: &str) -> Option<String> {
+    threads
+        .as_array()?
+        .iter()
+        .filter(|t| t.get("title").and_then(Value::as_str) == Some(title))
+        .filter_map(|t| Some((t.get("createdAt")?.as_str()?, t.get("threadId")?.as_str()?)))
+        // Both are RFC 3339 UTC times with milliseconds, so they order as strings.
+        .filter(|(created, _)| *created >= since)
+        .max()
+        .map(|(_, id)| id.to_string())
+}
+
 fn link(shown: &Value) -> Option<String> {
     shown.get("thread").and_then(|t| t.get("link")).and_then(Value::as_str).map(str::to_string)
 }
@@ -437,6 +481,17 @@ mod tests {
         );
         assert_eq!(follow.take_new(&second), ["Done\n\n"]);
         assert_eq!(follow.link.as_deref(), Some("https://t3/x"));
+    }
+
+    #[test]
+    fn the_interrupted_turns_thread_is_the_newest_with_the_title_made_since_it_began() {
+        let threads = json!([
+            {"threadId": "old", "title": "DEV-1 Fix", "createdAt": "2026-11-14T09:00:00.000Z"},
+            {"threadId": "other", "title": "DEV-2 Other", "createdAt": "2026-11-14T10:00:02.000Z"},
+            {"threadId": "t1", "title": "DEV-1 Fix", "createdAt": "2026-11-14T10:00:01.000Z"}
+        ]);
+        assert_eq!(thread_made_since(&threads, "DEV-1 Fix", "2026-11-14T10:00:00.000Z").as_deref(), Some("t1"));
+        assert_eq!(thread_made_since(&threads, "DEV-1 Fix", "2026-11-14T11:00:00.000Z"), None);
     }
 
     #[test]
