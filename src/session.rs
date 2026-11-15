@@ -134,8 +134,10 @@ impl Session {
         let start = backend::Start { spec, record: record.clone(), resume, interrupted };
         let mut driver = tokio::spawn(backend::run(start, command_rx, Reporter::new(report_tx)));
 
+        let log = EventLog::open(&registry, &record)?;
+        record.events = record.events.max(log.last_seq());
         let mut owner = Owner {
-            log: EventLog::open(&registry, &record)?,
+            log,
             registry,
             record,
             events: events_tx,
@@ -281,6 +283,12 @@ impl EventLog {
         let file =
             std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(|error| Error::io(format!("opening {}", path.display()), error))?;
         Ok(Self { file, path })
+    }
+
+    /// The seq of the log's last event. An owner that was killed logged events after it last saved the record's count.
+    fn last_seq(&self) -> u64 {
+        let text = std::fs::read_to_string(&self.path).unwrap_or_default();
+        text.lines().rev().find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok()?.get("seq")?.as_u64()).unwrap_or(0)
     }
 
     fn append(&mut self, event: &Event) {

@@ -844,6 +844,33 @@ fn a_t3_run_resumed_under_a_new_run_id_is_followed_to_its_end() {
 
 #[cfg(unix)]
 #[test]
+fn an_owner_that_takes_over_numbers_its_events_after_the_logs_last() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    std::fs::write(dir.join("start-exit"), "0").unwrap();
+    show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r1","text":"Started."}]"#);
+    let first = home.run(&["run", "t3", "--name", "q", "--provider", "claudeAgent", "--model", "m", "Start"]);
+    assert!(first.status.success(), "{}", text(&first));
+
+    // The owner dies after logging an event it never saved the count of.
+    show(&dir, "running", "\"r2\"", 0, r#"[{"role":"assistant","runId":"r2","text":"Working."}]"#);
+    let turn = home.run(&["send", "q", "Go on"]);
+    assert!(turn.status.success(), "{}", text(&turn));
+    home.wait_for("q", "message.delta");
+    home.kill_owner("q");
+    let record: Value = serde_json::from_str(&std::fs::read_to_string(home.dir.path().join("state/sessions/q.json")).unwrap()).unwrap();
+    let logged = home.events("q").last().unwrap()["seq"].as_u64().unwrap();
+    assert!(record["events"].as_u64().unwrap() < logged, "the record saved the count of every event: {record}");
+
+    show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r2","text":"Finished."}]"#);
+    let resumed = home.run(&["send", "q", "--wait", "Continue"]);
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    let seqs: Vec<u64> = home.events("q").iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+    assert_eq!(seqs, (1..=seqs.len() as u64).collect::<Vec<_>>(), "{}", home.logs());
+}
+
+#[cfg(unix)]
+#[test]
 fn a_wait_whose_owner_dies_mid_turn_ends_with_an_error() {
     let home = home(&[]);
     let dir = fake_t3(&home);

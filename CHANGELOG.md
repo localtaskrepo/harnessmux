@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- An owner that takes over a session numbers its events after the log's last `seq`. Before, it counted on from the
+  record's saved count, so after an owner was killed mid-turn the next owner's first events repeated seqs already in
+  the log (lotar DEV-590).
+
 ## 0.3.0 (2026-11-21)
 
 - Tool calls say what they did: `tool.started` gains `input` (the tool's arguments, ACP `rawInput`) and `locations`
