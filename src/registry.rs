@@ -43,6 +43,10 @@ pub struct SessionRecord {
     /// The agent's session id (ACP), thread id (T3, Amp); set once the agent created it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<String>,
+    /// When the agent was last asked to make its session (`t3 thread start`) and the id isn't saved yet; a resume
+    /// looks for a session made since then instead of making another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_asked: Option<String>,
     /// The adapter the session was created with (`@agentclientprotocol/codex-acp@2.6.0`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapter: Option<String>,
@@ -72,6 +76,7 @@ impl SessionRecord {
             cwd: cwd.to_path_buf(),
             project: project_of(cwd),
             agent_session: None,
+            agent_session_asked: None,
             adapter: None,
             profile,
             created: now.clone(),

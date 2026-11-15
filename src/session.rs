@@ -480,8 +480,14 @@ impl Owner {
         match report {
             Report::Options(options) => self.options = options,
             Report::Ready => {}
+            Report::AgentSessionAsked { since, saved } => {
+                self.record.agent_session_asked = since;
+                self.save();
+                let _ = saved.send(());
+            }
             Report::AgentSession { id, adapter } => {
                 self.record.agent_session = Some(id);
+                self.record.agent_session_asked = None;
                 if adapter.is_some() {
                     self.record.adapter = adapter;
                 }

@@ -41,6 +41,12 @@ pub enum Report {
         id: String,
         adapter: Option<String>,
     },
+    /// The agent is asked to make its session now (`Some(time)`), or it made none (`None`); `saved` answers once the
+    /// record holds it.
+    AgentSessionAsked {
+        since: Option<String>,
+        saved: oneshot::Sender<()>,
+    },
 }
 
 #[derive(Debug, Clone)]

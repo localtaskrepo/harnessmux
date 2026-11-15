@@ -1,7 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.1.9 (2026-11-15)
 
+- The session record notes when a t3 session asked T3 Code for its thread (`agent_session_asked`, saved before
+  `t3 thread start` runs) until the thread's id is saved. Every resume without the id looks the thread up from that
+  time, also after the turns that failed on a lookup left the session idle; before, only a resume of a session left
+  running did, so a later one could start a second thread. A session whose lookup failed looks again at each prompt
+  instead of failing every turn until another owner takes it over; a thread it finds is followed first (lotar
+  DEV-510).
 - A wait for a turn (`send --wait`, `run`, the MCP `wait` tool) whose owner stops without ending the turn (killed)
   fails within a few seconds, saying `harnessmux send <name>` resumes the session; before, it waited forever
   (lotar DEV-578).

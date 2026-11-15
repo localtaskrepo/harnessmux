@@ -136,10 +136,10 @@ T3 Code's CLI has no effort setting, no child threads, no interrupt and no permi
 says so, and `cancel` stops waiting while the thread keeps running in T3 Code. A thread that waits for an answer ends
 the turn with `waiting_for_answer` and a notice with the thread's link. When a session's owner died during a turn,
 the first turn after the resume follows the thread's run to its end instead of sending its prompt, so the agent
-doesn't work twice. An owner that died before it saved a new thread's id leaves the session without one; the resume
-then takes the newest thread with the session's `--title` made since the turn began. When `t3 thread list` can't be
-read (three tries), the session starts no thread, as it could be a second one, and fails its turns until it is
-resumed again. A `t3` that exits with an error while the thread still runs, or because the T3 Code server doesn't
+doesn't work twice. The session's record notes each `t3 thread start` (`agent_session_asked`) until the new thread's
+id is saved. A session resumed with that note and no id takes the newest thread with the session's `--title` made
+since then. When `t3 thread list` can't be read (three tries), the session starts no thread, as it could be a second
+one, and fails the turn; the note stays, so each later prompt and resume looks again. A `t3` that exits with an error while the thread still runs, or because the T3 Code server doesn't
 answer ("Could not reach the T3 Code server"), doesn't fail the turn: the turn follows the thread's run, waits up to 60
 minutes for the server and ends from the thread's state. A t3 session needs `--provider` with
 `--model` (`--provider claudeAgent --model claude-haiku-5-5`), starts its thread in the session's project and can
