@@ -155,7 +155,7 @@ enum Redirect {
 
 /// Reads a command line into its commands, each a list of words, the way a POSIX shell splits it: quotes, backslashes,
 /// `;` `&` `|` and newlines, subshells, `$(…)`, backticks, `<(…)`, redirections and comments. Words keep the text of
-/// variables (`$HOME`); a substitution leaves `$` in its word and its commands are listed as well. An unclosed quote
+/// variables (`$HOME`); a substitution or `${…}` leaves `$` in its word and the commands in it are listed as well. An unclosed quote
 /// runs to the end of the line.
 struct Shell {
     chars: Vec<char>,
@@ -249,7 +249,7 @@ impl Shell {
                     Some(c) => word.get_or_insert_default().push(c),
                     None => word.get_or_insert_default().push('\\'),
                 },
-                '$' => self.dollar(word.get_or_insert_default()),
+                '$' => self.dollar(word.get_or_insert_default(), false),
                 c => word.get_or_insert_default().push(c),
             }
         }
@@ -287,14 +287,15 @@ impl Shell {
                     self.list(Some('`'));
                     word.push('$');
                 }
-                '$' => self.dollar(word),
+                '$' => self.dollar(word, true),
                 c => word.push(c),
             }
         }
     }
 
     /// What follows a `$`: `$(…)`, `$'…'`, `$"…"`, `${…}` or a variable's name, which stays in the word as text.
-    fn dollar(&mut self, word: &mut String) {
+    /// `quoted`: the `$` is inside double quotes.
+    fn dollar(&mut self, word: &mut String, quoted: bool) {
         match self.peek() {
             Some('(') => {
                 self.at += 1;
@@ -320,15 +321,30 @@ impl Shell {
                 self.double_quoted(word);
             }
             Some('{') => {
+                self.at += 1;
+                self.braced(quoted);
                 word.push('$');
-                while let Some(c) = self.next() {
-                    word.push(c);
-                    if c == '}' {
-                        break;
-                    }
-                }
             }
             _ => word.push('$'),
+        }
+    }
+
+    /// The rest of a `${…}` up to the `}` that closes it. Substitutions in it run (`${x:-$(…)}`, `${x/a/$(…)}`), so
+    /// their commands are listed; single quotes quote only when the `${…}` isn't inside double quotes, as in bash.
+    fn braced(&mut self, quoted: bool) {
+        let mut text = String::new();
+        while let Some(c) = self.next() {
+            match c {
+                '}' => return,
+                '\\' => {
+                    self.next();
+                }
+                '\'' if !quoted => while self.next().is_some_and(|c| c != '\'') {},
+                '"' => self.double_quoted(&mut text),
+                '`' => self.list(Some('`')),
+                '$' => self.dollar(&mut text, quoted),
+                _ => {}
+            }
         }
     }
 }
@@ -492,6 +508,29 @@ mod tests {
         assert_eq!(rules().decide(&args, &roots).map(|(allow, _)| allow), Some(false));
         let args = json!({"toolCall": {"kind": "execute", "rawInput": {"command": ["git", "commit", "-m", "git push"]}}});
         assert_eq!(rules().decide(&args, &roots), None);
+    }
+
+    #[test]
+    fn commands_inside_parameter_expansions_are_read() {
+        let roots = [PathBuf::from("/work/repo")];
+        for line in [
+            "echo ${unset:-$(git push)}",
+            r#"echo "${unset:-$(git push)}""#,
+            "echo ${x:-`git push`}",
+            r#"echo ${x:+"$(git push)"}"#,
+            r#"echo "${x:-'$(git push)'}""#,
+            "echo ${a:-${b:-$(git push)}}",
+            "echo ${x/a/$(git push)}",
+            r"echo ${x:-\}}$(git push)",
+            "echo ${x:-}; git push",
+            "echo $(( $(git push) + 1 ))",
+            "echo ${x:-$(sh -c 'git push')}",
+        ] {
+            assert_eq!(rules().decide(&bash(line), &roots).map(|(allow, _)| allow), Some(false), "{line}");
+        }
+        for line in ["echo ${x:-'$(git push)'}", "echo '${x:-$(git push)}'", "echo ${HOME}/git push", r#"git -C "${HOME}/push" status"#] {
+            assert_eq!(rules().decide(&bash(line), &roots), None, "{line}");
+        }
     }
 
     #[test]

@@ -86,10 +86,13 @@ read-only and `allow` otherwise, since the mode already limits what the agent as
 Rules decide a request before the policy: `--deny-command "git push"` refuses a command line that runs it. The line is
 read as a shell reads it, so quoted words stay whole: also after `&&`, `;`, `|`, in `sh -c "…"` or `$(…)`, with the
 program's options in between such as `git -C "/tmp/my repo" -c a=b push`, or through `env` or `sudo`. A command the
-line builds while it runs (a program from a variable, a script piped into `sh`) isn't seen.
+line builds while it runs (a program from a variable, a script piped into `sh`) isn't seen: the rules are a best-effort
+layer, and only an agent's own sandbox stops a command for sure.
 `--deny-tool` and `--allow-tool` match the agent's tool name (Claude's `toolName`, else the title;
 `mcp__lotar__*` matches a prefix), and `--confine-writes` refuses edits outside the working directory and `--add-dir`.
-At workspace, Claude's shell commands run in its OS sandbox and still ask, so the rules see each one; Claude also gets
+At workspace, Claude's shell commands run in its OS sandbox, which blocks writes outside the session's directories,
+SSH, and the git hosts github.com, gitlab.com and bitbucket.org (so no push, and no fetch from them either). They still
+ask, so the rules see each one; Claude also gets
 the tool lists and denied commands as its own `allowedTools` and `disallowedTools` (`Bash(git push:*)`). In the library they are `Profile::rules`.
 
 ## Agents

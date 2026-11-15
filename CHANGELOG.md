@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.8 (2026-11-15)
+
+- Claude's workspace sandbox refuses network access to github.com, gitlab.com and bitbucket.org, so a workspace
+  session can't push however the command is written; it can't fetch from those hosts either (lotar DEV-509).
+- `deny_commands` also reads the commands in a parameter expansion (`${x:-$(git push)}`).
+
 ## 0.1.7 (2026-11-15)
 
 - A t3 session resumed after its owner died before it saved the thread's id no longer starts a thread when

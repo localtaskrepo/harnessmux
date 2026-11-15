@@ -318,7 +318,10 @@ command = ["my-agent", "--acp"]
             Rules { deny_commands: vec!["git push".into()], allow_tools: vec!["mcp__lotar".into()], deny_tools: vec!["WebFetch".into()], confine_writes: true };
         let meta = Value::Object(claude.session_meta(Permissions::Workspace, &rules).unwrap());
         let options = &meta["claudeCode"]["options"];
-        assert_eq!(options["settings"]["sandbox"], serde_json::json!({"enabled": true, "autoAllowBashIfSandboxed": false, "allowUnsandboxedCommands": false}));
+        assert_eq!(
+            options["settings"]["sandbox"],
+            serde_json::json!({"enabled": true, "autoAllowBashIfSandboxed": false, "allowUnsandboxedCommands": false, "network": {"deniedDomains": ["github.com", "gitlab.com", "bitbucket.org"]}})
+        );
         assert_eq!(options["allowedTools"], serde_json::json!(["mcp__lotar"]));
         assert_eq!(options["disallowedTools"], serde_json::json!(["WebFetch", "Bash(git push:*)"]));
         let full = Value::Object(claude.session_meta(Permissions::Full, &Rules::default()).unwrap_or_default());
