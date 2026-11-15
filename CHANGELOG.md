@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.6 (2026-11-15)
+
+- `deny_commands` reads the command line as a shell does instead of splitting it at spaces, so a quoted or escaped
+  word stays one word: `git -C "/tmp/my repo" push` is refused, `git commit -m "then git push"` is not. Redirections,
+  comments, subshells, `eval`, here-strings and more wrappers (`timeout`, `nice -n 10`) are read too; an argument-list
+  command keeps its arguments (lotar DEV-509).
+
 ## 0.1.5 (2026-11-15)
 
 - A t3 session whose owner died after `t3 thread start` made the thread and before the session saved its id resumes
