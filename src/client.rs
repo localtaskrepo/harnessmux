@@ -95,17 +95,38 @@ pub async fn send(registry: &Registry, name: &str, prompt: &str) -> Result<u64> 
     reply.turn.ok_or_else(|| Error::Protocol("the owner accepted the prompt but named no turn".into()))
 }
 
+/// How long a wait goes without new events before it checks that the session's owner still answers.
+const OWNER_CHECK: Duration = Duration::from_secs(2);
+
 /// Calls `each` for every event of `turn` (from `follower`'s position) until the turn ends; returns the ending event.
-/// Also ends when the session ends before the turn does.
-pub async fn wait_turn(follower: &mut Follower, turn: u64, timeout: Option<Duration>, mut each: impl FnMut(&Event)) -> Result<Event> {
+/// Also ends when the session ends before the turn does, and fails when the owner stops without ending either (killed).
+pub async fn wait_turn(
+    registry: &Registry,
+    name: &str,
+    follower: &mut Follower,
+    turn: u64,
+    timeout: Option<Duration>,
+    mut each: impl FnMut(&Event),
+) -> Result<Event> {
     let deadline = timeout.map(|timeout| Instant::now() + timeout);
     loop {
-        let batch = match deadline {
-            Some(deadline) => match tokio::time::timeout_at(deadline.into(), follower.next()).await {
-                Ok(batch) => batch?,
-                Err(_) => return Err(Error::Invalid(format!("turn {turn} did not end in time"))),
+        let check = Instant::now() + OWNER_CHECK;
+        let batch = match tokio::time::timeout_at(deadline.map_or(check, |deadline| deadline.min(check)).into(), follower.next()).await {
+            Ok(batch) => batch?,
+            Err(_) if deadline.is_some_and(|deadline| Instant::now() >= deadline) => {
+                return Err(Error::Invalid(format!("turn {turn} did not end in time")));
+            }
+            // An owner busy past the check still runs.
+            Err(_) if tokio::time::timeout(OWNER_CHECK, ipc::owner_running(registry, name)).await.unwrap_or(true) => continue,
+            // The owner may have written the turn's end just before it stopped.
+            Err(_) => match follower.read_new()? {
+                last if last.is_empty() => {
+                    return Err(Error::Agent(format!(
+                        "the owner of {name} stopped during turn {turn} without ending it; `harnessmux send {name}` resumes the session"
+                    )));
+                }
+                last => last,
             },
-            None => follower.next().await?,
         };
         for event in batch {
             let mine = event.turn == Some(turn);

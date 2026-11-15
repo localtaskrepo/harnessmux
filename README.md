@@ -66,8 +66,8 @@ The process that starts a session owns it: it holds the agent's ACP connection, 
 serves a socket (a Unix socket, a named pipe on Windows). `run` and `send` start a background owner,
 `harnessmux serve <name>`, which stops the agent after 30 minutes without a turn (`--idle-ttl`). The session stays: the
 next `send` starts a new owner, which resumes the agent's session with `session/resume`, or `session/load` when the
-agent only has that. A program that links the library owns its sessions itself, and the CLI reaches them the same
-way.
+agent only has that. A wait for a turn whose owner was killed fails within seconds instead of waiting for the turn. A
+program that links the library owns its sessions itself, and the CLI reaches them the same way.
 
 ## Profile mapping
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- A wait for a turn (`send --wait`, `run`, the MCP `wait` tool) whose owner stops without ending the turn (killed)
+  fails within a few seconds, saying `harnessmux send <name>` resumes the session; before, it waited forever
+  (lotar DEV-578).
+
 ## 0.1.8 (2026-11-15)
 
 - Claude's workspace sandbox refuses network access to github.com, gitlab.com and bitbucket.org, so a workspace

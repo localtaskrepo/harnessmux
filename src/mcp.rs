@@ -87,7 +87,7 @@ async fn call(registry: &Registry, table: &AgentTable, tool: &str, args: &Value)
             let timeout = Duration::from_secs(args.get("timeout_seconds").and_then(Value::as_u64).unwrap_or(600));
             let mut follower = Follower::from_start(&registry.events_path(name));
             let mut reply = String::new();
-            let end = client::wait_turn(&mut follower, turn, Some(timeout), |event| {
+            let end = client::wait_turn(registry, name, &mut follower, turn, Some(timeout), |event| {
                 if let EventBody::Message { text } = &event.body {
                     reply.push_str(text);
                 }

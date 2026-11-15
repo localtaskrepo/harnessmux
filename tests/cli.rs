@@ -445,6 +445,29 @@ fn a_t3_session_whose_owner_died_mid_turn_follows_the_thread_run_instead_of_send
     assert_eq!(calls.lines().filter(|call| *call == "thread send").count(), 1, "{calls}");
 }
 
+#[cfg(unix)]
+#[test]
+fn a_wait_whose_owner_dies_mid_turn_ends_with_an_error() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    std::fs::write(dir.join("start-exit"), "0").unwrap();
+    show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r1","text":"Started."}]"#);
+    let first = home.run(&["run", "t3", "--name", "d", "--provider", "claudeAgent", "--model", "m", "Start"]);
+    assert!(first.status.success(), "{}", text(&first));
+
+    // The second turn's `thread send` hangs; the owner dies while `send --wait` follows the turn.
+    show(&dir, "running", "\"r2\"", 0, r#"[{"role":"assistant","runId":"r2","text":"Working."}]"#);
+    let wait = home.cmd(&["send", "d", "--wait", "Go on"]).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    home.wait_for("d", "message.delta");
+    let status: Value = serde_json::from_slice(&home.run(&["status", "d", "--json"]).stdout).unwrap();
+    let pid = status["owner_pid"].as_u64().unwrap().to_string();
+    assert!(std::process::Command::new("kill").args(["-9", &pid]).status().unwrap().success());
+
+    let waited = home.finish(wait, &["send", "d", "--wait", "Go on"]);
+    assert!(!waited.status.success(), "{}", text(&waited));
+    assert!(String::from_utf8_lossy(&waited.stderr).contains("the owner of d stopped during turn 2"), "{}", text(&waited));
+}
+
 /// Session `n` with title "DEV-1 Fix" whose owner died in its first turn after `thread start` made t1 and before it
 /// saved t1's id; `list.json` lists t1 as made in that turn. Returns the record's path.
 #[cfg(unix)]

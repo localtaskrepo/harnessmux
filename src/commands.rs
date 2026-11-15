@@ -162,7 +162,7 @@ pub async fn dispatch(command: Command) -> Result<u8> {
                 println!("{turn}");
                 return Ok(0);
             }
-            print_turn(&mut follower, turn, json).await
+            print_turn(&registry, &name, &mut follower, turn, json).await
         }
         Command::Attach { name, from_start, json, project } => attach(&registry, name, from_start, json, project).await,
         Command::Resume { name } => {
@@ -241,13 +241,13 @@ async fn run(registry: &Registry, args: RunArgs) -> Result<u8> {
     }
     // Session-level events (session.started, notices) come before the turn's own.
     let mut printer = Printer::new(args.json);
-    let end = client::wait_turn(&mut follower, turn, None, |event| printer.print(event)).await?;
+    let end = client::wait_turn(registry, &name, &mut follower, turn, None, |event| printer.print(event)).await?;
     Ok(printer.finish(&end))
 }
 
-async fn print_turn(follower: &mut Follower, turn: u64, json: bool) -> Result<u8> {
+async fn print_turn(registry: &Registry, name: &str, follower: &mut Follower, turn: u64, json: bool) -> Result<u8> {
     let mut printer = Printer::new(json);
-    let end = client::wait_turn(follower, turn, None, |event| printer.print(event)).await?;
+    let end = client::wait_turn(registry, name, follower, turn, None, |event| printer.print(event)).await?;
     Ok(printer.finish(&end))
 }
 
