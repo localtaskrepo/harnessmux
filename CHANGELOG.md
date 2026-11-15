@@ -9,6 +9,10 @@
 - A denied permission request picks the option the agent table's new `reject` key names first. Codex gets `decline`
   ("continue without running it"), not `cancel`, which codex-acp also lists as `reject_once` and which can end the
   turn (lotar DEV-684).
+- `cargo xtask install` builds and installs `harnessmux` from a clone; on macOS it signs it first (identifier
+  `net.pyxzl.harnessmux`, hardened runtime) with `HARNESSMUX_SIGNING_IDENTITY` or the maintainer's Developer ID, so
+  keychain and firewall grants survive a new build (lotar DEV-564). `cargo install --git` now needs the package name
+  (`... harnessmux`): the repository is a workspace with the unpublished `xtask`.
 
 ## 0.1.10 (2026-11-17)
 

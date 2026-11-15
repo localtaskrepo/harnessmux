@@ -19,8 +19,18 @@ From a release: download the archive for your platform from
 From source (Rust 1.99 or newer):
 
 ```sh
-cargo install --git https://github.com/localtaskrepo/harnessmux
+git clone https://github.com/localtaskrepo/harnessmux && cd harnessmux
+cargo xtask install
 ```
+
+`cargo xtask install` builds `harnessmux` and installs it in `HARNESSMUX_INSTALL_DIR` (default `~/.cargo/bin`, where
+`cargo install` puts it). On macOS it signs it first, identifier `net.pyxzl.harnessmux` with the hardened runtime, so
+keychain and firewall grants survive a new build: with `HARNESSMUX_SIGNING_IDENTITY` (a name or SHA-1 hash from
+`security find-identity -v -p codesigning`) when set, else with the maintainer's Developer ID when the keychain has it,
+else ad-hoc with a warning. A set identity the keychain lacks, a failed codesign or a binary that doesn't run stops the
+install and leaves the installed `harnessmux` as it was. The first signing may ask at the Mac to use the key: choose
+Always Allow. `cargo install --git https://github.com/localtaskrepo/harnessmux harnessmux` and `cargo install
+harnessmux` work too, without the signing.
 
 Each agent needs its own CLI, installed and signed in (`claude`, `codex`, `copilot`, …): harnessmux uses your
 existing sign-ins. Claude and Codex also need Node.js: harnessmux installs their pinned ACP adapters with `npm` into

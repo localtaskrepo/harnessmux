@@ -28,7 +28,14 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Syste
 [dev-dependencies]
 tempfile = "3.27.0"
 
-[lints.clippy]
+[lints]
+workspace = true
+
+# `cargo xtask install` (xtask/): the signed local install. Not published; it only uses std.
+[workspace]
+members = ["xtask"]
+
+[workspace.lints.clippy]
 allow_attributes_without_reason = "warn" # #[allow] needs reason = "..."; prefer #[expect], which reports stale ones
 dbg_macro = "warn"
 todo = "warn"

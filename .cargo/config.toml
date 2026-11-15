@@ -1,0 +1,3 @@
+[alias]
+# The signed local install: README "Install".
+xtask = "run --quiet --package xtask --"
