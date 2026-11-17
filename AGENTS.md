@@ -8,6 +8,8 @@ its design: lotar `docs/developers/harness-tool-design.md`.
   local hooks; CI is the gate.
 - Check: `cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo nextest run`,
   `cargo deny check`. One test: `cargo nextest run <name>`.
+- Builds: tests and clippy build into `target/debug` without debug info (`[profile.dev]` in Cargo.toml, DEV-636);
+  `CARGO_PROFILE_DEV_DEBUG=true` for a debugger. Don't add other local profiles: each is a full build per worktree.
 - Live check of an agent (spends its quota): `HARNESSMUX_HOME=$(mktemp -d) harnessmux run <agent> --record
   /tmp/x.jsonl "Reply with exactly the word: pong"`.
 - Release: bump `version` in Cargo.toml and CHANGELOG.md, commit, tag `vX.Y.Z` (signed), push the tag. release.yml

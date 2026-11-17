@@ -32,6 +32,11 @@ dbg_macro = "warn"
 todo = "warn"
 unwrap_used = "warn" # no unwrap outside tests (clippy.toml allows it there); use ? or expect("why it cannot fail")
 
+# Tests, clippy and local builds (DEV-636): no debug info, which was half of target/debug in every worktree.
+# cargo's test profile inherits it. For a debugger: CARGO_PROFILE_DEV_DEBUG=true.
+[profile.dev]
+debug = false
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
