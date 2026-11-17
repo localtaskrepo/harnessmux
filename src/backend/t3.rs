@@ -1,5 +1,8 @@
-//! T3 Code threads through T3's CLI: the first turn is `t3 thread start <project> - --wait`, later turns
-//! `t3 thread send <thread> - --wait`, with the prompt on stdin; `t3 thread show --json` is polled to follow the run.
+//! T3 Code threads: the first turn is `t3 thread start <project> - --wait` with the prompt on stdin; in a session whose
+//! directory is a git worktree of its project, it is T3's MCP tool `t3_thread_launch` with that worktree
+//! (`existing_worktree`, full access), as T3's CLI can only make a new worktree. Later turns are `t3_thread_send`. Both
+//! carry a `clientRequestId` from the session (and the turn), so a retry never makes a second thread or run; the MCP
+//! sign-in is in [`super::t3_mcp`]. `t3 thread show --json` is polled to follow the run.
 //! The thread lives in T3 Code, so a session resumes by sending to it again; when the previous owner stopped during a
 //! turn, the first turn after the resume follows the thread's run instead, as that turn may still run. The record notes
 //! each `t3 thread start` until the new thread's id is saved; a session resumed without the id finds the thread by its
@@ -7,15 +10,19 @@
 //! waits for an answer ends the turn with `waiting_for_answer`. A `t3` that fails while the thread still runs, or
 //! because the T3 Code server doesn't answer, doesn't end the turn: it follows the thread's run, waiting for the server
 //! up to [`SERVER_WAIT`]. T3's CLI has no effort setting, no child threads, no permission answers and no interrupt.
+//! [`settle`] moves a finished thread to T3's Settled group.
 
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
+use super::t3_mcp::{Cli, Mcp};
 use super::{Command, Report, Reporter, Start, refuse};
+use crate::agents::AgentSpec;
 use crate::error::{Error, Result};
 use crate::event;
 use crate::event::{EventBody, StopReason, Usage};
@@ -34,10 +41,21 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
         let missing = if profile.provider.is_some() { "model" } else { "provider" };
         return Err(Error::Invalid(format!("the t3 agent takes a provider and a model together (T3: --provider with --model); set the {missing} too")));
     }
+    // A thread the session's turns started already runs where it was made.
+    let worktree = if start.record.agent_session.is_none() { worktree_of(&start.record.cwd, start.record.project.as_deref()) } else { None };
+    if let (Some(worktree), Some(base)) = (&worktree, &profile.worktree_base) {
+        return Err(Error::Invalid(format!(
+            "--worktree {base} starts the thread in a new worktree, but the session's directory {} is already a git worktree of {}; drop --worktree, or start the session in the main checkout",
+            worktree.display(),
+            start.record.project.as_deref().unwrap_or(Path::new("?")).display()
+        )));
+    }
     if let Some(effort) = profile.effort {
         reporter.notice(None, format!("T3's CLI has no effort setting; effort {effort} is not applied"));
     }
     let (program, base_args) = start.spec.launch_command().await?;
+    let cli = cli_of(&start, &program, &base_args);
+    let mut mcp = None;
     reporter.report(Report::Ready);
     let mut thread = start.record.agent_session.clone();
     let mut follow = Follow::default();
@@ -101,34 +119,58 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
             && let Some(id) = &thread
         {
             reporter.notice(Some(turn), "The previous owner stopped during a turn; this turn follows the T3 Code thread's run and doesn't send the prompt");
-            if !follow_run(&program, &start, id, turn, &mut follow, &mut commands, &reporter).await {
+            if !follow_run(&program, &start, id, turn, None, &mut follow, &mut commands, &reporter).await {
                 return Ok(());
             }
             continue;
         }
-        let mut args = base_args.clone();
-        match &thread {
-            Some(id) => args.extend(["thread".into(), "send".into(), id.clone(), "-".into(), "--wait".into()]),
-            None => {
-                // Saved before T3 makes the thread, so an owner that dies before it saves the id leaves a trace.
-                note_asked(&reporter, Some(event::now())).await;
-                let project = start.record.project.clone().unwrap_or_else(|| start.record.cwd.clone());
-                args.extend(["thread".into(), "start".into(), project.display().to_string(), "-".into()]);
-                if let Some(title) = &profile.title {
-                    args.extend(["--title".into(), title.clone()]);
-                }
-                if let (Some(provider), Some(model)) = (&profile.provider, &profile.model) {
-                    args.extend(["--provider".into(), provider.clone(), "--model".into(), model.clone()]);
-                }
-                if let Some(base) = &profile.worktree_base {
-                    args.extend(["--worktree".into(), base.clone()]);
-                    if let Some(branch) = &profile.branch {
-                        args.extend(["--branch".into(), branch.clone()]);
+        if let Some(id) = thread.clone() {
+            let arguments = json!({"threadId": id, "message": text, "mode": "auto", "clientRequestId": request_id(&start, &turn.to_string())});
+            match call(&mut mcp, &cli, "t3_thread_send", arguments).await {
+                Ok(sent) => {
+                    let run = sent.get("runId").and_then(Value::as_str);
+                    if !follow_run(&program, &start, &id, turn, run, &mut follow, &mut commands, &reporter).await {
+                        return Ok(());
                     }
                 }
-                args.push("--wait".into());
+                Err(error) => reporter.event(Some(turn), EventBody::TurnFailed { error: error.to_string() }, None),
+            }
+            continue;
+        }
+        // Saved before T3 makes the thread, so an owner that dies before it saves the id leaves a trace.
+        note_asked(&reporter, Some(event::now())).await;
+        if let Some(worktree) = &worktree {
+            match launch(&mut mcp, &cli, &start, worktree, &text).await {
+                Ok(launched) => {
+                    let id = launched.thread;
+                    thread = Some(id.clone());
+                    reporter.report(Report::AgentSession { id: id.clone(), adapter: None });
+                    follow.link = launched.link;
+                    reporter.event(None, started(&start, &id, "new", follow.link.clone()), None);
+                    if !follow_run(&program, &start, &id, turn, launched.run.as_deref(), &mut follow, &mut commands, &reporter).await {
+                        return Ok(());
+                    }
+                }
+                Err(error) => reporter.event(Some(turn), EventBody::TurnFailed { error: error.to_string() }, None),
+            }
+            continue;
+        }
+        let mut args = base_args.clone();
+        let project = start.record.project.clone().unwrap_or_else(|| start.record.cwd.clone());
+        args.extend(["thread".into(), "start".into(), project.display().to_string(), "-".into()]);
+        if let Some(title) = &profile.title {
+            args.extend(["--title".into(), title.clone()]);
+        }
+        if let (Some(provider), Some(model)) = (&profile.provider, &profile.model) {
+            args.extend(["--provider".into(), provider.clone(), "--model".into(), model.clone()]);
+        }
+        if let Some(base) = &profile.worktree_base {
+            args.extend(["--worktree".into(), base.clone()]);
+            if let Some(branch) = &profile.branch {
+                args.extend(["--branch".into(), branch.clone()]);
             }
         }
+        args.push("--wait".into());
         let mut child = tokio::process::Command::new(&program)
             .args(&args)
             .envs(start.spec.env.iter().chain(&profile.env))
@@ -211,7 +253,7 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
             && still_going(&program, &start, id, &error_text).await
         {
             reporter.notice(Some(turn), format!("t3 exited with {status} while the thread goes on; this turn follows its run: {link}"));
-            if !follow_run(&program, &start, id, turn, &mut follow, &mut commands, &reporter).await {
+            if !follow_run(&program, &start, id, turn, None, &mut follow, &mut commands, &reporter).await {
                 return Ok(());
             }
             continue;
@@ -229,12 +271,15 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
     Ok(())
 }
 
-/// Follow the thread's latest run to its end as `turn`, without sending a prompt. `false` when the session closes.
+/// Follow the thread's latest run (or `run`, once T3 shows it) to its end as `turn`, without sending a prompt. `false`
+/// when the session closes.
+#[expect(clippy::too_many_arguments, reason = "the run loop's state, passed down")]
 async fn follow_run(
     program: &std::path::Path,
     start: &Start,
     thread: &str,
     turn: u64,
+    run: Option<&str>,
     follow: &mut Follow,
     commands: &mut mpsc::UnboundedReceiver<Command>,
     reporter: &Reporter,
@@ -252,7 +297,8 @@ async fn follow_run(
                         reporter.event(Some(turn), EventBody::MessageDelta { text: message }, None);
                     }
                     let state = RunState::of(&shown);
-                    if !state.running || state.waiting {
+                    let current = run.is_none_or(|run| state.run.as_deref() == Some(run));
+                    if current && (!state.running || state.waiting) {
                         break shown;
                     }
                 }
@@ -452,6 +498,8 @@ struct RunState {
     waiting: bool,
     /// The thread's status (running, completed, …).
     status: String,
+    /// The run: the active one, else the latest.
+    run: Option<String>,
     /// The run's last reply.
     reply: Option<String>,
 }
@@ -474,7 +522,8 @@ impl RunState {
             .filter(|text| !text.is_empty())
             .map(str::to_string);
         Self {
-            running: status == "running" || active,
+            run: run.map(str::to_string),
+            running: matches!(status.as_str(), "running" | "starting") || active,
             waiting: thread.and_then(|t| t.get("pendingRequestCount")).and_then(Value::as_u64).is_some_and(|count| count > 0),
             status,
             reply,
@@ -524,8 +573,130 @@ fn thread_id(line: &str) -> Option<String> {
 }
 
 /// Electron's note that the t3 launcher runs Node with app defaults, printed on every run.
-fn is_noise(line: &str) -> bool {
+pub(super) fn is_noise(line: &str) -> bool {
     line.contains(":ERROR:electron/") && line.contains("Node.js environment variables are disabled")
+}
+
+fn cli_of(start: &Start, program: &Path, args: &[String]) -> Cli {
+    let env = start.spec.env.iter().chain(&start.record.profile.env).map(|(key, value)| (key.clone(), value.clone())).collect();
+    Cli { program: program.to_path_buf(), args: args.to_vec(), env, cwd: start.record.cwd.clone() }
+}
+
+/// Calls a T3 Code MCP tool, signing in on the first call.
+async fn call(mcp: &mut Option<Mcp>, cli: &Cli, tool: &str, arguments: Value) -> Result<Value> {
+    let connected = match mcp {
+        Some(connected) => connected,
+        None => mcp.insert(Mcp::connect(cli).await?),
+    };
+    connected.call(cli, tool, arguments).await
+}
+
+/// A request id for T3 Code: the same for the same session (`created` tells apart sessions of one name) and `what`.
+fn request_id(start: &Start, what: &str) -> String {
+    format!("harnessmux:{}:{}:{what}", start.record.name, start.record.created)
+}
+
+/// The worktree `cwd` is in when that is a linked worktree of `project`, not its main checkout.
+fn worktree_of(cwd: &Path, project: Option<&Path>) -> Option<PathBuf> {
+    let project = project?;
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--path-format=absolute", "--show-toplevel"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let top = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let same = |a: &Path, b: &Path| a.canonicalize().ok().zip(b.canonicalize().ok()).is_some_and(|(a, b)| a == b);
+    (!same(&top, project)).then_some(top)
+}
+
+struct Launched {
+    thread: String,
+    link: Option<String>,
+    run: Option<String>,
+}
+
+/// Starts the session's thread in `worktree` with `t3_thread_launch`, full access.
+async fn launch(mcp: &mut Option<Mcp>, cli: &Cli, start: &Start, worktree: &Path, text: &str) -> Result<Launched> {
+    let project = start.record.project.as_deref().ok_or_else(|| Error::Invalid("a t3 session in a worktree needs its repository".into()))?;
+    let project_id = project_id(mcp, cli, project).await?;
+    let profile = &start.record.profile;
+    let mut arguments = json!({
+        "title": profile.title.clone().unwrap_or_else(|| start.record.name.clone()),
+        "projectId": project_id,
+        "workspaceStrategy": {"type": "existing_worktree", "worktreePath": worktree.display().to_string()},
+        "runtimeMode": "full-access",
+        "message": text,
+        "clientRequestId": request_id(start, "launch"),
+    });
+    if let (Some(provider), Some(model)) = (&profile.provider, &profile.model) {
+        arguments["modelSelection"] = json!({"instanceId": provider, "model": model});
+    }
+    let launched = call(mcp, cli, "t3_thread_launch", arguments).await?;
+    let text = |key: &str| launched.get(key).and_then(Value::as_str).map(str::to_string);
+    let thread = text("threadId").ok_or_else(|| Error::Agent(format!("T3 Code's t3_thread_launch named no thread: {launched}")))?;
+    Ok(Launched { thread, link: text("link"), run: text("runId") })
+}
+
+/// The id of the T3 Code project whose workspace is `project`.
+async fn project_id(mcp: &mut Option<Mcp>, cli: &Cli, project: &Path) -> Result<String> {
+    let wanted = project.canonicalize().unwrap_or_else(|_| project.to_path_buf());
+    let mut cursor = Value::Null;
+    loop {
+        let mut arguments = json!({"limit": 100});
+        if !cursor.is_null() {
+            arguments["cursor"] = cursor;
+        }
+        let page = call(mcp, cli, "t3_project_list", arguments).await?;
+        let found = page
+            .get("projects")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|p| p.get("workspaceRoot").and_then(Value::as_str).is_some_and(|root| Path::new(root).canonicalize().is_ok_and(|root| root == wanted)));
+        if let Some(id) = found.and_then(|p| p.get("id")).and_then(Value::as_str) {
+            return Ok(id.to_string());
+        }
+        cursor = page.get("nextCursor").cloned().unwrap_or(Value::Null);
+        if cursor.is_null() {
+            return Err(Error::Agent(format!("T3 Code has no project for {}; add it in T3 Code first", project.display())));
+        }
+    }
+}
+
+/// Moves the session's thread to T3's Settled group (it stays reachable by its link), only when its last run finished
+/// and it doesn't wait for an answer; a thread that runs, waits, failed or was interrupted stays active. Returns the
+/// thread's link.
+pub async fn settle(spec: &AgentSpec, record: &crate::registry::SessionRecord) -> Result<String> {
+    if spec.kind != crate::agents::AgentKind::T3 {
+        return Err(Error::Invalid(format!("session {} runs {}; only t3 sessions have a thread to settle", record.name, record.agent)));
+    }
+    let thread = record.agent_session.clone().ok_or_else(|| Error::Invalid(format!("session {} has no T3 Code thread to settle", record.name)))?;
+    let (program, args) = spec.launch_command().await?;
+    let start = Start { spec: spec.clone(), record: record.clone(), resume: true, interrupted: false };
+    let Shown::Thread(shown) = show(&program, &start, &thread).await else {
+        return Err(Error::Agent(format!("could not read the T3 Code thread {thread} with `t3 thread show`; not settled")));
+    };
+    let state = RunState::of(&shown);
+    let link = link(&shown).unwrap_or_else(|| thread.clone());
+    let refused = if state.waiting {
+        Some("waits for an answer".to_string())
+    } else if state.running {
+        Some("still runs".to_string())
+    } else if state.status != "completed" {
+        Some(format!("ended its last run with status '{}'", state.status))
+    } else {
+        None
+    };
+    if let Some(why) = refused {
+        return Err(Error::Invalid(format!("the T3 Code thread {why}, so it stays active: {link}")));
+    }
+    let cli = cli_of(&start, &program, &args);
+    call(&mut None, &cli, "t3_thread_organize", json!({"threadId": thread, "action": "settle"})).await?;
+    Ok(link)
 }
 
 #[cfg(test)]

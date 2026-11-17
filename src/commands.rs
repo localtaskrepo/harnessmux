@@ -179,6 +179,12 @@ pub async fn dispatch(command: Command) -> Result<u8> {
         Command::List { json, project } => list(&registry, json, project),
         Command::Status { name, json } => status(&registry, &name, json).await,
         Command::Close { name, forget } => close(&registry, &name, forget).await,
+        Command::Settle { name } => {
+            let record = registry.load(&name)?;
+            let link = harnessmux::backend::t3::settle(AgentTable::load()?.get(&record.agent)?, &record).await?;
+            println!("{link}");
+            Ok(0)
+        }
         Command::Capabilities { agent, json } => {
             let table = AgentTable::load()?;
             let value = match agent {

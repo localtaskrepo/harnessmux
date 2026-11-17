@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.10 (2026-11-17)
+
+- A t3 session whose directory is a git worktree of its project starts its thread there, with full access, through
+  T3 Code's MCP tool `t3_thread_launch` (`existing_worktree`); before, T3 made the thread in the main checkout or a new
+  worktree. `--worktree` is refused in such a directory (lotar DEV-657).
+- Later turns of every t3 session go through the MCP tool `t3_thread_send`. The launch and each send carry a
+  `clientRequestId` made from the session and the turn, so a retry starts no second thread or run.
+- harnessmux signs in to T3 Code's MCP server with a pairing code from `t3 auth pairing create` and keeps the OAuth
+  token for 30 days in `<state>/t3-credential.json` (mode 0600); T3 Code lists the sign-in as session `harnessmux`.
+  A revoked or expired token signs in again.
+- `harnessmux settle <name>` (and `backend::t3::settle` in the library) moves a t3 session's thread to T3 Code's
+  Settled group when its last run finished and it doesn't wait for an answer.
+- Tested with T3 Code 0.1.10.
+
 ## 0.1.9 (2026-11-15)
 
 - The session record notes when a t3 session asked T3 Code for its thread (`agent_session_asked`, saved before

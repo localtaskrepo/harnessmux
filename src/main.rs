@@ -85,6 +85,9 @@ enum Command {
         #[arg(long)]
         forget: bool,
     },
+    /// t3: move the session's T3 Code thread to T3's Settled group, when its last run finished and it doesn't wait for
+    /// an answer.
+    Settle { name: String },
     /// Show the agents, whether they are installed and what they offer; with an agent, start it to ask.
     Capabilities {
         agent: Option<String>,

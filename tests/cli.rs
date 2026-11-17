@@ -344,9 +344,10 @@ fn start_errors_reach_the_caller_and_leave_no_session() {
 }
 
 /// A fake `t3` CLI in `dir`: `thread start` names thread t1, prints `start-error` (if any) to stderr and exits with
-/// the code in `start-exit` after `start-sleep` seconds, `thread send` hangs, `thread show` prints `show.json`,
-/// `thread list` prints `list.json` (or fails while `list-fail` exists); every call is appended to `calls`.
-/// While `down` holds a number above 0, `thread show` counts it down and fails as T3's CLI does when its server is down.
+/// the code in `start-exit` after `start-sleep` seconds, `thread show` prints `show.json`, `thread list` prints
+/// `list.json` (or fails while `list-fail` exists), `auth pairing create` prints pairing code `pair-1` (fails while
+/// `pairing-fail` exists); every call is appended to `calls`. While `down` holds a number above 0, `thread show` counts
+/// it down and fails as T3's CLI does when its server is down. A [`fake_t3_server`] answers T3 Code's MCP endpoint.
 #[cfg(unix)]
 fn fake_t3(home: &Home) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
@@ -360,7 +361,9 @@ dir=$(dirname "$0")
 echo "$1 $2" >> "$dir/calls"
 case "$1 $2" in
   "thread start") cat > /dev/null; echo "Thread t1" >&2; cat "$dir/start-error" >&2 2>/dev/null; sleep "$(cat "$dir/start-sleep" 2>/dev/null || echo 0)"; echo "Started."; exit "$(cat "$dir/start-exit")" ;;
-  "thread send") cat > /dev/null; exec sleep 20 ;;
+  "auth pairing")
+    if [ -f "$dir/pairing-fail" ]; then echo "Could not reach the T3 Code server at http://127.0.0.1:3773" >&2; exit 1; fi
+    echo '{"credential":"pair-1","expiresAt":"2026-01-01T00:02:00.000Z","id":"p","label":"harnessmux","scopes":[]}' ;;
   "thread list")
     if [ -f "$dir/list-fail" ]; then echo "Could not reach the T3 Code server at http://127.0.0.1:3773" >&2; exit 1; fi
     cat "$dir/list.json" ;;
@@ -377,12 +380,178 @@ esac
     )
     .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let t3_home = dir.join("t3home");
+    std::fs::create_dir_all(t3_home.join("userdata")).unwrap();
+    let origin = fake_t3_server(&dir, &home.cwd);
+    std::fs::write(t3_home.join("userdata/server-runtime.json"), format!(r#"{{"version":1,"origin":"{origin}"}}"#)).unwrap();
     std::fs::write(
         home.dir.path().join("config/agents.toml"),
-        format!("[agents.t3]\nkind = \"t3\"\ncommand = [{:?}]\nlive = false\n", script.display().to_string()),
+        format!(
+            "[agents.t3]\nkind = \"t3\"\ncommand = [{:?}]\nlive = false\nenv = {{ T3CODE_HOME = {:?} }}\n",
+            script.display().to_string(),
+            t3_home.display().to_string()
+        ),
     )
     .unwrap();
     dir
+}
+
+#[cfg(unix)]
+fn base64url(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | (u32::from(*b) << (16 - 8 * i)));
+        for i in 0..=chunk.len() {
+            out.push(char::from(ALPHABET[(n >> (18 - 6 * i) & 63) as usize]));
+        }
+    }
+    out
+}
+
+/// A fake T3 Code server for `dir`'s fake `t3`, with one project at `project`: the MCP OAuth sign-in (the pairing code
+/// `pair-1`, PKCE checked) and `/mcp`. `t3_thread_launch` returns thread t1 (the same thread for a repeated
+/// `clientRequestId`), or fails with the text in `launch-error`; `t3_thread_send` and the launch name run r2. Each
+/// sign-in step and tool call is appended to `calls` (`oauth token`, `mcp <tool> <arguments>`). Once `revoke` exists,
+/// the next `/mcp` request finds every token revoked (and removes the file). Returns the origin.
+#[cfg(unix)]
+fn fake_t3_server(dir: &Path, project: &Path) -> String {
+    use sha2::Digest as _;
+    use std::collections::{HashMap, HashSet};
+    use std::io::{BufRead as _, Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let (dir, project) = (dir.to_path_buf(), project.to_path_buf());
+    std::thread::spawn(move || {
+        let log = |line: String| {
+            let mut file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("calls")).unwrap();
+            writeln!(file, "{line}").unwrap();
+        };
+        let (mut tokens, mut codes, mut threads) = (HashSet::new(), HashMap::new(), HashMap::new());
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let path = request_line.split_whitespace().nth(1).unwrap_or_default().to_string();
+            let (mut length, mut bearer) = (0, String::new());
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let line = line.trim_end();
+                if line.is_empty() {
+                    break;
+                }
+                let (key, value) = line.split_once(':').unwrap();
+                match key.to_ascii_lowercase().as_str() {
+                    "content-length" => length = value.trim().parse().unwrap(),
+                    "authorization" => bearer = value.trim().trim_start_matches("Bearer ").to_string(),
+                    _ => {}
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let body = String::from_utf8(body).unwrap();
+            let json = |status: u16, value: Value| (status, value.to_string());
+            let (status, answer) = match path.as_str() {
+                "/oauth/mcp/register" => {
+                    log("oauth register".into());
+                    json(201, serde_json::json!({"client_id": "c1"}))
+                }
+                "/oauth/mcp/decision" => {
+                    let request: Value = serde_json::from_str(&body).unwrap();
+                    let decision = &request["decision"];
+                    if decision["code"] != "pair-1" || decision["access"] != "full-access" {
+                        json(400, serde_json::json!({"error": "invalid_grant", "error_description": "Invalid pairing code"}))
+                    } else {
+                        let code = format!("ac{}", codes.len() + 1);
+                        codes.insert(code.clone(), request["authorization"]["code_challenge"].as_str().unwrap().to_string());
+                        json(200, serde_json::json!({"redirectTo": format!("http://127.0.0.1/callback?code={code}&state=s")}))
+                    }
+                }
+                "/oauth/mcp/token" => {
+                    let form: HashMap<&str, &str> = body.split('&').filter_map(|pair| pair.split_once('=')).collect();
+                    let challenge = codes.remove(form["code"]).unwrap();
+                    assert_eq!(base64url(&sha2::Sha256::digest(form["code_verifier"].as_bytes())), challenge, "PKCE");
+                    let token = format!("tok-secret-{}", tokens.len() + 1);
+                    tokens.insert(token.clone());
+                    log("oauth token".into());
+                    json(200, serde_json::json!({"access_token": token, "token_type": "Bearer", "expires_in": 2_592_000}))
+                }
+                "/mcp" => {
+                    if std::fs::remove_file(dir.join("revoke")).is_ok() {
+                        tokens.clear();
+                    }
+                    let request: Value = serde_json::from_str(&body).unwrap();
+                    if !tokens.contains(&bearer) {
+                        json(401, serde_json::json!({"error": "invalid_mcp_credential"}))
+                    } else if request.get("id").is_none() {
+                        (202, String::new())
+                    } else if request["method"] == "initialize" {
+                        json(200, serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": {"protocolVersion": "2025-06-18", "capabilities": {}}}))
+                    } else {
+                        let (tool, arguments) = (request["params"]["name"].as_str().unwrap(), &request["params"]["arguments"]);
+                        log(format!("mcp {tool} {arguments}"));
+                        let thread = |id: &str| serde_json::json!({"threadId": id, "link": format!("https://t3/{id}"), "runId": "r2", "status": "starting"});
+                        let result = match tool {
+                            "t3_project_list" => Ok(serde_json::json!({"projects": [{"id": "p1", "workspaceRoot": project}], "nextCursor": null})),
+                            "t3_thread_launch" => match std::fs::read_to_string(dir.join("launch-error")) {
+                                Ok(error) => Err(error),
+                                Err(_) => {
+                                    let n = threads.len() + 1;
+                                    let id = threads.entry(arguments["clientRequestId"].as_str().unwrap().to_string()).or_insert_with(|| format!("t{n}"));
+                                    Ok(thread(id))
+                                }
+                            },
+                            "t3_thread_send" => Ok(thread(arguments["threadId"].as_str().unwrap())),
+                            _ => Ok(serde_json::json!({"sequence": 1})),
+                        };
+                        let result = match result {
+                            Ok(content) => {
+                                serde_json::json!({"content": [{"type": "text", "text": content.to_string()}], "structuredContent": content, "isError": false})
+                            }
+                            Err(error) => serde_json::json!({"content": [{"type": "text", "text": error}], "isError": true}),
+                        };
+                        json(200, serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": result}))
+                    }
+                }
+                _ => (404, String::new()),
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\nmcp-session-id: s1\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{answer}",
+                answer.len()
+            );
+        }
+    });
+    origin
+}
+
+/// The fake T3 Code server's calls of `tool`, with their arguments.
+#[cfg(unix)]
+fn mcp_calls(dir: &Path, tool: &str) -> Vec<Value> {
+    let calls = std::fs::read_to_string(dir.join("calls")).unwrap_or_default();
+    let prefix = format!("mcp {tool} ");
+    calls.lines().filter_map(|line| line.strip_prefix(&prefix)).map(|args| serde_json::from_str(args).unwrap()).collect()
+}
+
+#[cfg(unix)]
+fn count_calls(dir: &Path, call: &str) -> usize {
+    std::fs::read_to_string(dir.join("calls")).unwrap_or_default().lines().filter(|line| *line == call).count()
+}
+
+/// Makes `home.cwd` a git repository with a commit and adds the worktree `<home>/wt`; returns its path.
+#[cfg(unix)]
+fn git_worktree(home: &Home) -> PathBuf {
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git").args(args).current_dir(&home.cwd).output().unwrap();
+        assert!(output.status.success(), "git {args:?}: {}", text(&output));
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "first"]);
+    let worktree = home.dir.path().join("wt");
+    git(&["worktree", "add", "-q", "-b", "agent/DEV-1", worktree.to_str().unwrap()]);
+    worktree.canonicalize().unwrap()
 }
 
 #[cfg(unix)]
@@ -441,7 +610,7 @@ fn a_t3_session_whose_owner_died_mid_turn_follows_the_thread_run_instead_of_send
     let first = home.run(&["run", "t3", "--name", "k", "--provider", "claudeAgent", "--model", "m", "Start"]);
     assert!(first.status.success(), "{}", text(&first));
 
-    // The second turn's `thread send` hangs; the owner dies during it.
+    // The second turn's run keeps running; the owner dies while it follows the run.
     show(&dir, "running", "\"r2\"", 0, r#"[{"role":"assistant","runId":"r2","text":"Working."}]"#);
     let turn = home.run(&["send", "k", "Go on"]);
     assert!(turn.status.success(), "{}", text(&turn));
@@ -453,8 +622,7 @@ fn a_t3_session_whose_owner_died_mid_turn_follows_the_thread_run_instead_of_send
     let resumed = home.run(&["send", "k", "--wait", "Continue"]);
     assert!(resumed.status.success(), "{}", text(&resumed));
     assert!(String::from_utf8_lossy(&resumed.stdout).contains("Finished."), "{}", text(&resumed));
-    let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
-    assert_eq!(calls.lines().filter(|call| *call == "thread send").count(), 1, "{calls}");
+    assert_eq!(mcp_calls(&dir, "t3_thread_send").len(), 1);
 }
 
 #[cfg(unix)]
@@ -467,7 +635,7 @@ fn a_wait_whose_owner_dies_mid_turn_ends_with_an_error() {
     let first = home.run(&["run", "t3", "--name", "d", "--provider", "claudeAgent", "--model", "m", "Start"]);
     assert!(first.status.success(), "{}", text(&first));
 
-    // The second turn's `thread send` hangs; the owner dies while `send --wait` follows the turn.
+    // The second turn's run keeps running; the owner dies while `send --wait` follows the turn.
     show(&dir, "running", "\"r2\"", 0, r#"[{"role":"assistant","runId":"r2","text":"Working."}]"#);
     let wait = home.cmd(&["send", "d", "--wait", "Go on"]).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
     home.wait_for("d", "message.delta");
@@ -522,7 +690,7 @@ fn a_t3_session_whose_owner_died_before_it_saved_the_thread_finds_the_thread_by_
     assert!(String::from_utf8_lossy(&resumed.stdout).contains("Finished."), "{}", text(&resumed));
     let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
     assert_eq!(calls.lines().filter(|call| *call == "thread start").count(), 1, "{calls}");
-    assert!(calls.lines().all(|call| call != "thread send"), "{calls}");
+    assert!(mcp_calls(&dir, "t3_thread_send").is_empty(), "{calls}");
     let record: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(record["agent_session"], "t1");
 }
@@ -569,5 +737,195 @@ fn a_t3_session_that_cant_look_up_the_interrupted_turns_thread_starts_no_second_
     assert!(record.get("agent_session_asked").is_none(), "{record}");
     let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
     assert_eq!(calls.lines().filter(|call| *call == "thread start").count(), 1, "{calls}");
-    assert!(calls.lines().all(|call| call != "thread send"), "{calls}");
+    assert!(mcp_calls(&dir, "t3_thread_send").is_empty(), "{calls}");
+}
+
+/// Every file under `root` that holds `needle`, the kept credential aside.
+#[cfg(unix)]
+fn files_holding(root: &Path, needle: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.file_name().is_some_and(|name| name != "t3-credential.json")
+                && std::fs::read(&path).is_ok_and(|bytes| String::from_utf8_lossy(&bytes).contains(needle))
+            {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+#[cfg(unix)]
+#[test]
+fn a_t3_session_in_a_worktree_launches_its_thread_there_and_sends_later_turns_through_mcp() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    let worktree = git_worktree(&home);
+    show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r2","text":"Done."}]"#);
+    let wt = worktree.to_str().unwrap();
+    let run = home.run(&["run", "t3", "--name", "w", "--cwd", wt, "--provider", "claudeAgent", "--model", "m", "--title", "DEV-1 Fix", "Fix it"]);
+    assert!(run.status.success(), "{}", text(&run));
+    assert!(String::from_utf8_lossy(&run.stdout).contains("Done."), "{}", text(&run));
+
+    assert_eq!(count_calls(&dir, "thread start"), 0);
+    let launches = mcp_calls(&dir, "t3_thread_launch");
+    assert_eq!(launches.len(), 1, "{launches:?}");
+    let launch = &launches[0];
+    assert_eq!(launch["projectId"], "p1", "{launch}");
+    assert_eq!(launch["workspaceStrategy"]["type"], "existing_worktree", "{launch}");
+    assert_eq!(Path::new(launch["workspaceStrategy"]["worktreePath"].as_str().unwrap()).canonicalize().unwrap(), worktree);
+    assert_eq!(launch["runtimeMode"], "full-access", "{launch}");
+    assert_eq!(launch["title"], "DEV-1 Fix", "{launch}");
+    assert_eq!(launch["modelSelection"], serde_json::json!({"instanceId": "claudeAgent", "model": "m"}), "{launch}");
+    assert_eq!(launch["message"], "Fix it", "{launch}");
+    let launch_id = launch["clientRequestId"].as_str().unwrap();
+    assert!(launch_id.starts_with("harnessmux:w:") && launch_id.ends_with(":launch"), "{launch_id}");
+    let events = home.events("w");
+    let started = events.iter().find(|e| e["type"] == "session.started").unwrap();
+    assert_eq!(started["link"], "https://t3/t1", "{started}");
+
+    // The credential is kept for the user only; the token reaches no log or record.
+    let credential = home.dir.path().join("state/t3-credential.json");
+    assert_eq!(std::fs::metadata(&credential).unwrap().permissions().mode() & 0o777, 0o600);
+    assert!(std::fs::read_to_string(&credential).unwrap().contains("tok-secret-1"));
+    assert_eq!(files_holding(&home.dir.path().join("state"), "tok-secret"), Vec::<PathBuf>::new());
+    assert_eq!(files_holding(&home.dir.path().join("state"), "pair-1"), Vec::<PathBuf>::new());
+
+    let next = home.run(&["send", "w", "--wait", "Go on"]);
+    assert!(next.status.success(), "{}", text(&next));
+    let sends = mcp_calls(&dir, "t3_thread_send");
+    assert_eq!(sends.len(), 1, "{sends:?}");
+    assert_eq!(sends[0]["threadId"], "t1");
+    assert_eq!(sends[0]["message"], "Go on");
+    assert_eq!(sends[0]["mode"], "auto");
+    let send_id = sends[0]["clientRequestId"].as_str().unwrap();
+    assert!(send_id.starts_with("harnessmux:w:") && send_id.ends_with(":2"), "{send_id}");
+
+    // A second session signs in no more.
+    let other = home.run(&["run", "t3", "--name", "x", "--cwd", wt, "--provider", "claudeAgent", "--model", "m", "Other"]);
+    assert!(other.status.success(), "{}", text(&other));
+    assert_eq!(count_calls(&dir, "oauth token"), 1);
+    assert_eq!(mcp_calls(&dir, "t3_thread_launch")[1]["title"], "x");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_revoked_or_expired_t3_credential_signs_in_again() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    let worktree = git_worktree(&home);
+    show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r2","text":"Done."}]"#);
+    let wt = worktree.to_str().unwrap();
+    let run = home.run(&["run", "t3", "--name", "r", "--cwd", wt, "--provider", "claudeAgent", "--model", "m", "Fix it"]);
+    assert!(run.status.success(), "{}", text(&run));
+    assert_eq!(count_calls(&dir, "oauth token"), 1);
+
+    std::fs::write(dir.join("revoke"), "").unwrap();
+    let revoked = home.run(&["send", "r", "--wait", "Go on"]);
+    assert!(revoked.status.success(), "{}", text(&revoked));
+    assert_eq!(count_calls(&dir, "oauth token"), 2);
+
+    let path = home.dir.path().join("state/t3-credential.json");
+    let mut credential: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    credential["expires_at"] = Value::from(1);
+    std::fs::write(&path, credential.to_string()).unwrap();
+    // A running session keeps its token; a new one reads the expired credential.
+    let expired = home.run(&["run", "t3", "--name", "e", "--cwd", wt, "--provider", "claudeAgent", "--model", "m", "Fix it"]);
+    assert!(expired.status.success(), "{}", text(&expired));
+    assert_eq!(count_calls(&dir, "oauth token"), 3);
+    assert_eq!(mcp_calls(&dir, "t3_thread_send").len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_t3_session_in_a_worktree_refuses_a_new_worktree() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    let worktree = git_worktree(&home);
+    let run = home.run(&[
+        "run",
+        "t3",
+        "--name",
+        "b",
+        "--cwd",
+        worktree.to_str().unwrap(),
+        "--provider",
+        "claudeAgent",
+        "--model",
+        "m",
+        "--worktree",
+        "main",
+        "Fix it",
+    ]);
+    assert!(!run.status.success(), "{}", text(&run));
+    assert!(text(&run).contains("is already a git worktree of"), "{}", text(&run));
+    assert!(mcp_calls(&dir, "t3_thread_launch").is_empty());
+    assert_eq!(count_calls(&dir, "thread start"), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_t3_launch_fails_the_turn_and_the_retry_asks_with_the_same_request_id() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    let worktree = git_worktree(&home);
+    show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r2","text":"Done."}]"#);
+    let wt = worktree.to_str().unwrap();
+
+    std::fs::write(dir.join("pairing-fail"), "").unwrap();
+    let unpaired = home.run(&["run", "t3", "--name", "f", "--cwd", wt, "--provider", "claudeAgent", "--model", "m", "Fix it"]);
+    assert!(!unpaired.status.success(), "{}", text(&unpaired));
+    assert!(text(&unpaired).contains("Could not reach the T3 Code server"), "{}", text(&unpaired));
+    assert!(mcp_calls(&dir, "t3_thread_launch").is_empty());
+    std::fs::remove_file(dir.join("pairing-fail")).unwrap();
+
+    std::fs::write(dir.join("launch-error"), "Project p1 has no worktree there").unwrap();
+    let refused = home.run(&["send", "f", "--wait", "Fix it"]);
+    assert!(!refused.status.success(), "{}", text(&refused));
+    assert!(text(&refused).contains("T3 Code refused t3_thread_launch: Project p1 has no worktree there"), "{}", text(&refused));
+    let record: Value = serde_json::from_str(&std::fs::read_to_string(home.dir.path().join("state/sessions/f.json")).unwrap()).unwrap();
+    assert!(record.get("agent_session").is_none(), "{record}");
+    std::fs::remove_file(dir.join("launch-error")).unwrap();
+
+    let retried = home.run(&["send", "f", "--wait", "Fix it"]);
+    assert!(retried.status.success(), "{}", text(&retried));
+    let launches = mcp_calls(&dir, "t3_thread_launch");
+    assert_eq!(launches.len(), 2, "{launches:?}");
+    assert_eq!(launches[0]["clientRequestId"], launches[1]["clientRequestId"]);
+    assert_eq!(count_calls(&dir, "thread start"), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn settle_moves_a_finished_t3_thread_to_settled_and_keeps_one_that_needs_a_look() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    std::fs::write(dir.join("start-exit"), "0").unwrap();
+    show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r1","text":"Done."}]"#);
+    let run = home.run(&["run", "t3", "--name", "s", "--provider", "claudeAgent", "--model", "m", "Fix it"]);
+    assert!(run.status.success(), "{}", text(&run));
+
+    for (status, active, pending, why) in [
+        ("completed", "null", 1, "waits for an answer"),
+        ("running", "\"r2\"", 0, "still runs"),
+        ("failed", "null", 0, "ended its last run with status 'failed'"),
+    ] {
+        show(&dir, status, active, pending, "[]");
+        let kept = home.run(&["settle", "s"]);
+        assert!(!kept.status.success(), "{}", text(&kept));
+        assert!(text(&kept).contains(why) && text(&kept).contains("https://t3/t1"), "{}", text(&kept));
+    }
+    assert!(mcp_calls(&dir, "t3_thread_organize").is_empty());
+
+    show(&dir, "completed", "null", 0, "[]");
+    let settled = home.run(&["settle", "s"]);
+    assert!(settled.status.success(), "{}", text(&settled));
+    assert!(String::from_utf8_lossy(&settled.stdout).contains("https://t3/t1"), "{}", text(&settled));
+    assert_eq!(mcp_calls(&dir, "t3_thread_organize"), vec![serde_json::json!({"threadId": "t1", "action": "settle"})]);
 }

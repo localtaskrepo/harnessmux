@@ -6,7 +6,7 @@ process, one mapping for model, effort and permissions, and one JSONL event stre
 
 It speaks the [Agent Client Protocol](https://agentclientprotocol.com) (ACP) with the official Rust SDK
 ([`agent-client-protocol`](https://crates.io/crates/agent-client-protocol) 5.2). Amp has no ACP server and T3 Code is
-driven through its own CLI; both sit behind the same session interface.
+driven through its own CLI and MCP server; both sit behind the same session interface.
 
 It is a Rust library and a CLI. [lotar](https://github.com/localtaskrepo/lotar) links the library to run its agent
 jobs; the CLI is for people, other agents and other apps.
@@ -47,6 +47,7 @@ harnessmux close fix-calc
 | `answer <name> <request> <option>` | Answer a permission request (with `--on-permission ask`). |
 | `set <name> <option> <value>` | Set one of the agent's config options; `status` lists them. |
 | `list`, `status <name>`, `close <name>` | Sessions; one session's state, agent session id and options; end a session. |
+| `settle <name>` | t3: move the session's thread to T3 Code's Settled group when its last run finished and it doesn't wait for an answer; prints the link. |
 | `capabilities [agent]` | The agents, whether they are installed, their adapters; with an agent, start it and list what it offers. |
 | `mcp` | An MCP server on stdio with tools to start, send to, wait for, cancel and close child sessions. |
 | `replay FILE` | An ACP agent that plays back a recording made with `run --record`, for tests. |
@@ -117,7 +118,7 @@ command = ["my-agent", "--acp"]
 | claude | `claude-agent-acp` 0.107.0 | run live: new, send, resume after the owner was killed, cancel |
 | codex | `codex-acp` 2.6.0 | run live: new, send, effort |
 | copilot | `copilot --acp --stdio` (1.0.111) | run live: one turn, a model error reported as `turn.failed` |
-| t3 | `t3 thread start/send/show` (T3 Code 0.1.9) | run live: new thread, a second turn in it |
+| t3 | `t3 thread start/show` and T3 Code's MCP server (T3 Code 0.1.10) | run live: new thread, a thread in an existing worktree, a later turn, a repeated launch and send, settle |
 | gemini | `gemini --acp` | from its docs, not run live |
 | cursor | `cursor-agent acp` | from its docs, not run live |
 | droid | `droid exec --output-format acp` | from its docs, not run live |
@@ -144,6 +145,16 @@ answer ("Could not reach the T3 Code server"), doesn't fail the turn: the turn f
 minutes for the server and ends from the thread's state. A t3 session needs `--provider` with
 `--model` (`--provider claudeAgent --model claude-haiku-5-5`), starts its thread in the session's project and can
 start it in a new worktree (`--worktree main --branch agent/x`).
+
+A t3 session whose directory is a git worktree of its project starts its thread in that worktree, with full access,
+through T3 Code's MCP tool `t3_thread_launch` (`existing_worktree`), as T3's CLI can only make a new worktree;
+`--worktree` is refused there. Every later turn of a t3 session goes through `t3_thread_send`. Both carry a
+`clientRequestId` made from the session and the turn, so a retry after an error starts no second thread or run.
+harnessmux signs in to T3 Code's MCP server once: it makes a pairing code with `t3 auth pairing create` (2 minutes,
+never shown or logged) and trades it for an OAuth token, kept for 30 days in `<state>/t3-credential.json` (readable by
+the user only). T3 Code lists it as session `harnessmux`; `t3 auth session revoke <id>` ends it, and the next turn
+signs in again. The server's address comes from T3 Code's `userdata/server-runtime.json` (`T3CODE_HOME`, default
+`~/.t3`).
 
 ## Events
 

@@ -13,6 +13,7 @@ use crate::registry::SessionRecord;
 pub mod acp;
 pub mod amp;
 pub mod t3;
+mod t3_mcp;
 
 /// What the owner asks a driver to do.
 #[derive(Debug)]
