@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- A Codex turn that ends on Codex's own error text (model at capacity, high demand, retry limit, stream cut off) is
+  `turn.failed`, also after tools ran: codex-acp sends these as the turn's last message and `end_turn` (acpx #850).
+- A denied permission request picks the option the agent table's new `reject` key names first. Codex gets `decline`
+  ("continue without running it"), not `cancel`, which codex-acp also lists as `reject_once` and which can end the
+  turn (lotar DEV-684).
+
 ## 0.1.10 (2026-11-17)
 
 - A t3 session whose directory is a git worktree of its project starts its thread there, with full access, through

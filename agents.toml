@@ -11,6 +11,7 @@
 # effort    harnessmux effort (low, medium, high, xhigh, max) -> the agent's value
 # modes     harnessmux permissions (read-only, workspace, full) -> the agent's mode value
 # meta      harnessmux permissions -> the ACP `_meta` a session opens with (new, load, resume)
+# reject    ids of the reject options a deny picks first, in order; else the first reject_once, then reject_always
 # rules_meta where the agent takes harnessmux's permission rules natively: dotted `_meta` paths for allow_tools and
 #           deny_tools, and `command`, the tool pattern a denied command becomes (`{}` is the command)
 # paths     extra directories searched for the program when it is not on PATH (~ is the home directory)
@@ -42,6 +43,8 @@ live = true
 options = { model = "model", effort = "reasoning_effort", mode = "mode" }
 effort = { low = "low", medium = "medium", high = "high", xhigh = "xhigh", max = "max" }
 modes = { read-only = "read-only", workspace = "workspace-write", full = "agent-full-access" }
+# codex-acp lists `cancel` ("No, and tell Codex what to do differently") as reject_once too; it can end the turn.
+reject = ["decline", "reject_permissions"]
 
 [agents.copilot]
 kind = "acp"

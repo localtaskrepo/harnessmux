@@ -442,7 +442,12 @@ impl Driver {
         } else {
             &[PermissionOptionKind::RejectOnce, PermissionOptionKind::RejectAlways]
         };
-        let chosen = kinds.iter().find_map(|kind| request.options.iter().find(|o| o.kind == *kind)).map(|o| o.option_id.to_string());
+        let preferred = if allow {
+            None
+        } else {
+            self.start.spec.reject.iter().find_map(|id| request.options.iter().find(|o| kinds.contains(&o.kind) && o.option_id.0.as_ref() == id))
+        };
+        let chosen = preferred.or_else(|| kinds.iter().find_map(|kind| request.options.iter().find(|o| o.kind == *kind))).map(|o| o.option_id.to_string());
         let outcome = match &chosen {
             Some(option) => RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option.clone())),
             None => RequestPermissionOutcome::Cancelled,

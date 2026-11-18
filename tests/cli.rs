@@ -199,6 +199,19 @@ fn a_recorded_codex_session_maps_effort_onto_reasoning_effort() {
 }
 
 #[test]
+fn a_codex_deny_declines_instead_of_cancelling_and_an_overloaded_turn_fails() {
+    let home = home(&[("codex", "codex-overloaded-after-a-deny.jsonl", CODEX)]);
+    let run = home.run(&["run", "codex", "--name", "o1", "--effort", "low", "--on-permission", "deny", "Run the tests"]);
+    // codex-acp lists `cancel` (ends the turn) and `decline` both as reject_once; a deny takes `decline` by id.
+    let answered = home.events("o1").into_iter().find(|e| e["type"] == "permission.answered").unwrap();
+    assert_eq!(answered["option"], "decline", "{answered}");
+    // codex-acp sends `server_overloaded` as the turn's text and ends with end_turn (acpx #850), also after tools ran.
+    assert_eq!(run.status.code(), Some(1), "{}", text(&run));
+    let failed = home.events("o1").into_iter().find(|e| e["type"] == "turn.failed").unwrap();
+    assert!(failed["error"].as_str().unwrap().contains("at capacity"), "{failed}");
+}
+
+#[test]
 fn copilot_without_an_effort_option_gets_a_notice() {
     let home = home(&[("copilot", "copilot-one-turn.jsonl", r#"options = { model = "model", mode = "mode" }"#)]);
     let run = home.run(&["run", "copilot", "--name", "g1", "--model", "auto", "--effort", "low", "Reply with exactly the word: pong"]);

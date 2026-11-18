@@ -84,6 +84,9 @@ pub struct AgentSpec {
     pub meta: BTreeMap<String, Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules_meta: Option<RulesMeta>,
+    /// Ids of the reject options a deny picks first, in order (codex-acp's `cancel` also ends the turn).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reject: Vec<String>,
 }
 
 impl AgentSpec {

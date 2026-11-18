@@ -82,7 +82,8 @@ program that links the library owns its sessions itself, and the CLI reaches the
 `--model` is passed as the agent lists it; a model the agent doesn't list is refused with the valid ones. An effort
 or mode the agent doesn't offer is a `notice` event, not an error. Permission requests the agent still sends follow
 `--on-permission`: `deny`, `allow-reads`, `allow` or `ask` (wait for `answer`). The default is `allow-reads` for
-read-only and `allow` otherwise, since the mode already limits what the agent asks for.
+read-only and `allow` otherwise, since the mode already limits what the agent asks for. A refusal picks the reject
+option the agent table's `reject` names first (Codex: `decline`, not `cancel`, which can end the turn).
 
 Rules decide a request before the policy: `--deny-command "git push"` refuses a command line that runs it. The line is
 read as a shell reads it, so quoted words stay whole: also after `&&`, `;`, `|`, in `sh -c "…"` or `$(…)`, with the

@@ -78,9 +78,24 @@ const FAILURE_TEXTS: &[&str] = &[
     "insufficient_quota",
 ];
 
-/// The error a reply reports, when the reply is a short error text and the turn ran no tools.
+/// Codex's own error messages (codex-rs `CodexErr`) that codex-acp sends as the turn's last paragraph before
+/// `end_turn` instead of failing the prompt (acpx #850): server overloaded, high demand, retries used up (429 and 5xx),
+/// stream cut off. A reply whose last paragraph starts with one fails the turn, also when tools ran first.
+const LAST_PARAGRAPH_FAILURES: &[&str] = &[
+    "selected model is at capacity",
+    "we're currently experiencing high demand",
+    "exceeded retry limit, last status:",
+    "stream disconnected before completion",
+];
+
+/// The error a reply reports: a short error text in a turn that ran no tools, or a Codex error as the last paragraph.
 pub fn failure_in_reply(reply: &str, ran_tools: bool) -> Option<String> {
     let trimmed = reply.trim();
+    let last = trimmed.rsplit("\n\n").next().unwrap_or_default().trim();
+    let last_lower = last.to_lowercase().replace('\u{2019}', "'");
+    if LAST_PARAGRAPH_FAILURES.iter().any(|text| last_lower.starts_with(text)) {
+        return Some(last.to_string());
+    }
     if ran_tools || trimmed.is_empty() || trimmed.len() > 1_500 {
         return None;
     }
@@ -195,6 +210,11 @@ mod tests {
         assert!(failure_in_reply("Error: Execution failed: Model \"gpt-5.4\" is not available.", false).is_some());
         assert!(failure_in_reply("model_not_found", true).is_none());
         assert!(failure_in_reply("Fixed the bug in add().", false).is_none());
+        let overloaded = "Selected model is at capacity. Please try a different model.";
+        assert_eq!(failure_in_reply(&format!("Looking at the tests.\n\n{overloaded}\n\n"), true).as_deref(), Some(overloaded));
+        assert!(failure_in_reply("We\u{2019}re currently experiencing high demand, which may cause temporary errors.", true).is_some());
+        assert!(failure_in_reply("exceeded retry limit, last status: 429 Too Many Requests", false).is_some());
+        assert!(failure_in_reply("The model said the server is at capacity, so I retried.\n\nDone.", true).is_none());
     }
 
     #[test]
