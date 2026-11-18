@@ -78,23 +78,30 @@ const FAILURE_TEXTS: &[&str] = &[
     "insufficient_quota",
 ];
 
-/// Codex's own error messages (codex-rs `CodexErr`) that codex-acp sends as the turn's last paragraph before
-/// `end_turn` instead of failing the prompt (acpx #850): server overloaded, high demand, retries used up (429 and 5xx),
-/// stream cut off. A reply whose last paragraph starts with one fails the turn, also when tools ran first.
+/// Codex's own error messages (codex-rs `CodexErr`, codex 0.169.0) that codex-acp sends as a message chunk of their
+/// own before `end_turn` instead of failing the prompt (acpx #850): server overloaded, high demand, policy-restricted or
+/// flex capacity gone, retries used up (429 and 5xx), stream cut off. A reply whose last paragraph or last chunk
+/// starts with one fails the turn, also when tools ran first.
 const LAST_PARAGRAPH_FAILURES: &[&str] = &[
     "selected model is at capacity",
     "we're currently experiencing high demand",
+    "policy-restricted capacity is unavailable",
+    "flex capacity unavailable",
     "exceeded retry limit, last status:",
     "stream disconnected before completion",
 ];
 
-/// The error a reply reports: a short error text in a turn that ran no tools, or a Codex error as the last paragraph.
-pub fn failure_in_reply(reply: &str, ran_tools: bool) -> Option<String> {
+/// The error a reply reports: a Codex error as the last paragraph of the reply or of its last chunk (the chunk
+/// catches an error glued onto an earlier message without a blank line), else a short error text in a turn that
+/// ran no tools.
+pub fn failure_in_reply(reply: &str, last_chunk: &str, ran_tools: bool) -> Option<String> {
     let trimmed = reply.trim();
-    let last = trimmed.rsplit("\n\n").next().unwrap_or_default().trim();
-    let last_lower = last.to_lowercase().replace('\u{2019}', "'");
-    if LAST_PARAGRAPH_FAILURES.iter().any(|text| last_lower.starts_with(text)) {
-        return Some(last.to_string());
+    for text in [trimmed, last_chunk] {
+        let last = text.trim().rsplit("\n\n").next().unwrap_or_default().trim();
+        let last_lower = last.to_lowercase().replace('\u{2019}', "'");
+        if LAST_PARAGRAPH_FAILURES.iter().any(|failure| last_lower.starts_with(failure)) {
+            return Some(last.to_string());
+        }
     }
     if ran_tools || trimmed.is_empty() || trimmed.len() > 1_500 {
         return None;
@@ -205,16 +212,22 @@ mod tests {
 
     #[test]
     fn error_replies_fail_the_turn_but_normal_replies_do_not() {
-        assert!(failure_in_reply("Error: model_not_found: The model `gpt-6.1-sol` does not exist", false).is_some());
-        assert!(failure_in_reply("Not logged in · Please run /login", false).is_some());
-        assert!(failure_in_reply("Error: Execution failed: Model \"gpt-5.4\" is not available.", false).is_some());
-        assert!(failure_in_reply("model_not_found", true).is_none());
-        assert!(failure_in_reply("Fixed the bug in add().", false).is_none());
+        assert!(failure_in_reply("Error: model_not_found: The model `gpt-6.1-sol` does not exist", "", false).is_some());
+        assert!(failure_in_reply("Not logged in · Please run /login", "", false).is_some());
+        assert!(failure_in_reply("Error: Execution failed: Model \"gpt-5.4\" is not available.", "", false).is_some());
+        assert!(failure_in_reply("model_not_found", "", true).is_none());
+        assert!(failure_in_reply("Fixed the bug in add().", "", false).is_none());
         let overloaded = "Selected model is at capacity. Please try a different model.";
-        assert_eq!(failure_in_reply(&format!("Looking at the tests.\n\n{overloaded}\n\n"), true).as_deref(), Some(overloaded));
-        assert!(failure_in_reply("We\u{2019}re currently experiencing high demand, which may cause temporary errors.", true).is_some());
-        assert!(failure_in_reply("exceeded retry limit, last status: 429 Too Many Requests", false).is_some());
-        assert!(failure_in_reply("The model said the server is at capacity, so I retried.\n\nDone.", true).is_none());
+        assert_eq!(failure_in_reply(&format!("Looking at the tests.\n\n{overloaded}\n\n"), "", true).as_deref(), Some(overloaded));
+        assert!(failure_in_reply("We\u{2019}re currently experiencing high demand, which may cause temporary errors.", "", true).is_some());
+        assert!(failure_in_reply("exceeded retry limit, last status: 429 Too Many Requests", "", false).is_some());
+        assert!(failure_in_reply("The model said the server is at capacity, so I retried.\n\nDone.", "", true).is_none());
+        let policy = "Policy-restricted capacity is unavailable. Please try again later.";
+        assert_eq!(failure_in_reply(&format!("Running the tests.\n\n{policy}\n\n"), "", true).as_deref(), Some(policy));
+        assert!(failure_in_reply("Flex capacity unavailable.", "", true).is_some());
+        let glued = "Looking at the failing test.Flex capacity unavailable.\n\n";
+        assert_eq!(failure_in_reply(glued, "Flex capacity unavailable.\n\n", true).as_deref(), Some("Flex capacity unavailable."));
+        assert!(failure_in_reply("Flex capacity unavailable. Switched to the standard tier.\n\nDone.", "Done.", true).is_none());
     }
 
     #[test]

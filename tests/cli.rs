@@ -212,6 +212,16 @@ fn a_codex_deny_declines_instead_of_cancelling_and_an_overloaded_turn_fails() {
 }
 
 #[test]
+fn a_codex_error_glued_onto_an_earlier_message_fails_the_turn() {
+    let home = home(&[("codex", "codex-error-glued-onto-a-message.jsonl", CODEX)]);
+    let run = home.run(&["run", "codex", "--name", "g1", "--effort", "low", "Fix the failing test"]);
+    // codex-acp sends the error as a chunk of its own; the message before it ends without a blank line.
+    assert_eq!(run.status.code(), Some(1), "{}", text(&run));
+    let failed = home.events("g1").into_iter().find(|e| e["type"] == "turn.failed").unwrap();
+    assert_eq!(failed["error"], "Flex capacity unavailable.", "{failed}");
+}
+
+#[test]
 fn copilot_without_an_effort_option_gets_a_notice() {
     let home = home(&[("copilot", "copilot-one-turn.jsonl", r#"options = { model = "model", mode = "mode" }"#)]);
     let run = home.run(&["run", "copilot", "--name", "g1", "--model", "auto", "--effort", "low", "Reply with exactly the word: pong"]);

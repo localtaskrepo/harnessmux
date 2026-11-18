@@ -2,8 +2,10 @@
 
 ## Unreleased
 
-- A Codex turn that ends on Codex's own error text (model at capacity, high demand, retry limit, stream cut off) is
-  `turn.failed`, also after tools ran: codex-acp sends these as the turn's last message and `end_turn` (acpx #850).
+- A Codex turn that ends on Codex's own error text (model at capacity, high demand, policy-restricted or flex
+  capacity unavailable, retry limit, stream cut off) is `turn.failed`, also after tools ran: codex-acp sends these as
+  the turn's last message and `end_turn` (acpx #850). The turn's last chunk is checked too, so an error glued onto an
+  earlier message without a blank line also fails it (lotar DEV-691).
 - A denied permission request picks the option the agent table's new `reject` key names first. Codex gets `decline`
   ("continue without running it"), not `cancel`, which codex-acp also lists as `reject_once` and which can end the
   turn (lotar DEV-684).

@@ -136,6 +136,8 @@ struct Pending {
 struct Turn {
     id: u64,
     reply: String,
+    /// The latest message chunk: codex-acp sends an error as a chunk of its own.
+    last_chunk: String,
     ran_tools: bool,
     future: PromptFuture,
 }
@@ -237,7 +239,10 @@ impl Driver {
         for body in acp_map::map_update(&update) {
             if let Some(current) = turn.as_deref_mut() {
                 match &body {
-                    EventBody::MessageDelta { text } => current.reply.push_str(text),
+                    EventBody::MessageDelta { text } => {
+                        current.reply.push_str(text);
+                        current.last_chunk.clone_from(text);
+                    }
                     EventBody::ToolStarted { .. } => current.ran_tools = true,
                     _ => {}
                 }
@@ -389,7 +394,7 @@ impl Driver {
         let cx = cx.clone();
         let request = PromptRequest::new(session.clone(), vec![ContentBlock::Text(TextContent::new(text))]);
         let future: PromptFuture = Box::pin(async move { cx.send_request(request).block_task().await });
-        Turn { id, reply: String::new(), ran_tools: false, future }
+        Turn { id, reply: String::new(), last_chunk: String::new(), ran_tools: false, future }
     }
 
     fn end_turn(&self, turn: Turn, done: std::result::Result<PromptResponse, agent_client_protocol::Error>) {
@@ -402,7 +407,7 @@ impl Driver {
             Ok(response) => {
                 let raw = json_of(&response);
                 let stop_reason: StopReason = raw.get("stopReason").cloned().and_then(|v| serde_json::from_value(v).ok()).unwrap_or(StopReason::EndTurn);
-                match acp_map::failure_in_reply(&turn.reply, turn.ran_tools) {
+                match acp_map::failure_in_reply(&turn.reply, &turn.last_chunk, turn.ran_tools) {
                     Some(error) if stop_reason != StopReason::Cancelled => self.reporter.event(id, EventBody::TurnFailed { error }, Some(raw)),
                     _ => self.reporter.event(id, EventBody::TurnFinished { stop_reason, usage: acp_map::prompt_usage(&raw) }, Some(raw)),
                 }
