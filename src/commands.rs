@@ -478,7 +478,10 @@ impl Printer {
                 let first = prompt.lines().next().unwrap_or_default();
                 self.note(&format!("> {first}"));
             }
-            EventBody::TurnFailed { error } => self.note(&format!("turn failed: {error}")),
+            EventBody::TurnFailed { error, resets_at, .. } => match resets_at {
+                Some(at) => self.note(&format!("turn failed: {error} (resets at {at})")),
+                None => self.note(&format!("turn failed: {error}")),
+            },
             EventBody::TurnFinished { stop_reason, .. } => {
                 if self.mid_line {
                     println!();

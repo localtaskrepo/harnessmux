@@ -36,6 +36,7 @@ pub fn map_update(update: &Value) -> Vec<EventBody> {
                 context_used: update.get("used").and_then(Value::as_u64),
                 context_size: update.get("size").and_then(Value::as_u64),
                 cost_usd: cost.and_then(|cost| cost.get("amount")).and_then(Value::as_f64),
+                rate_limit: update.get("_meta").and_then(|meta| meta.get("_claude/rateLimit")).and_then(crate::failure::rate_limit),
                 ..Usage::default()
             };
             if usage.is_empty() { Vec::new() } else { vec![EventBody::Usage(usage)] }
@@ -75,6 +76,9 @@ const FAILURE_TEXTS: &[&str] = &[
     "unexpected status 5",
     "usage limit",
     "rate limit reached",
+    "hit your limit",
+    "-hour limit",
+    "weekly limit",
     "insufficient_quota",
 ];
 
@@ -214,6 +218,7 @@ mod tests {
     fn error_replies_fail_the_turn_but_normal_replies_do_not() {
         assert!(failure_in_reply("Error: model_not_found: The model `gpt-6.1-sol` does not exist", "", false).is_some());
         assert!(failure_in_reply("Not logged in · Please run /login", "", false).is_some());
+        assert!(failure_in_reply("You've hit your 5-hour limit · resets 6pm (America/Los_Angeles)", "", false).is_some());
         assert!(failure_in_reply("Error: Execution failed: Model \"gpt-5.4\" is not available.", "", false).is_some());
         assert!(failure_in_reply("model_not_found", "", true).is_none());
         assert!(failure_in_reply("Fixed the bug in add().", "", false).is_none());

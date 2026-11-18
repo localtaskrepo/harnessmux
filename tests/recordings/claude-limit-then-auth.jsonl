@@ -1,0 +1,9 @@
+{"to":"agent","msg":{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1}}}
+{"to":"client","msg":{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"resume":{}}},"agentInfo":{"name":"@agentclientprotocol/claude-agent-acp","title":"Claude Agent","version":"0.107.0"},"authMethods":[]}}}
+{"to":"agent","msg":{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/work/repo","mcpServers":[]}}}
+{"to":"client","msg":{"jsonrpc":"2.0","id":1,"result":{"sessionId":"s-1"}}}
+{"to":"agent","msg":{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"s-1","prompt":[{"type":"text","text":"Fix add()"}]}}}
+{"to":"client","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-1","update":{"sessionUpdate":"usage_update","used":21000,"size":200000,"_meta":{"_claude/rateLimit":{"status":"rejected","resetsAt":1794675600,"rateLimitType":"five_hour","utilization":1}}}}}}
+{"to":"client","msg":{"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"You've hit your limit · resets 6pm (Europe/Berlin)","data":{"errorKind":"rate_limit","rateLimit":{"status":"rejected","resetsAt":1794675600,"rateLimitType":"five_hour","utilization":1}}}}}
+{"to":"agent","msg":{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"s-1","prompt":[{"type":"text","text":"And now?"}]}}}
+{"to":"client","msg":{"jsonrpc":"2.0","id":3,"error":{"code":-32000,"message":"Authentication required"}}}

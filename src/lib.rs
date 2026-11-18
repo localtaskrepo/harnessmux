@@ -37,6 +37,7 @@ pub mod capabilities;
 pub mod client;
 pub mod error;
 pub mod event;
+pub mod failure;
 pub mod follow;
 pub mod ipc;
 pub mod mcp;
@@ -49,7 +50,7 @@ pub mod session;
 
 pub use agents::{AgentKind, AgentSpec, AgentTable};
 pub use error::{Error, Result};
-pub use event::{Event, EventBody, StopReason, Usage};
+pub use event::{Event, EventBody, Failure, FailureKind, RateLimit, StopReason, Usage};
 pub use profile::{Effort, McpServer, PermissionPolicy, Permissions, Profile};
 pub use registry::{Registry, SessionRecord, SessionState};
 pub use rules::Rules;

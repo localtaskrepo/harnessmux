@@ -1,0 +1,7 @@
+{"to":"agent","msg":{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1}}}
+{"to":"client","msg":{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"resume":{}}},"agentInfo":{"name":"@agentclientprotocol/codex-acp","title":"Codex","version":"2.6.0"},"authMethods":[]}}}
+{"to":"agent","msg":{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/work/repo","mcpServers":[]}}}
+{"to":"client","msg":{"jsonrpc":"2.0","id":1,"result":{"sessionId":"s-1"}}}
+{"to":"agent","msg":{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"s-1","prompt":[{"type":"text","text":"Fix add()"}]}}}
+{"to":"client","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage to purchase more credits or try again at Nov 21st, 2026 9:36 PM.\n\n"}}}}}
+{"to":"client","msg":{"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"Internal error","data":{"message":"You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage to purchase more credits or try again at Nov 21st, 2026 9:36 PM.","codexErrorInfo":"usageLimitExceeded"}}}}

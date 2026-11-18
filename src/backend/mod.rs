@@ -30,7 +30,8 @@ pub enum Command {
 pub enum Report {
     Event {
         turn: Option<u64>,
-        body: EventBody,
+        /// Boxed: an event is much larger than the other reports.
+        body: Box<EventBody>,
         raw: Option<Value>,
     },
     /// The agent's config options as they are now.
@@ -38,16 +39,10 @@ pub enum Report {
     /// The driver takes prompts now: the agent runs and the profile is applied.
     Ready,
     /// The agent's session id, once known.
-    AgentSession {
-        id: String,
-        adapter: Option<String>,
-    },
+    AgentSession { id: String, adapter: Option<String> },
     /// The agent is asked to make its session now (`Some(time)`), or it made none (`None`); `saved` answers once the
     /// record holds it.
-    AgentSessionAsked {
-        since: Option<String>,
-        saved: oneshot::Sender<()>,
-    },
+    AgentSessionAsked { since: Option<String>, saved: oneshot::Sender<()> },
 }
 
 #[derive(Debug, Clone)]
@@ -60,7 +55,7 @@ impl Reporter {
 
     pub fn event(&self, turn: Option<u64>, body: EventBody, raw: Option<Value>) {
         // The owner stops listening only when it shuts down, and then nothing reads events anyway.
-        let _ = self.0.send(Report::Event { turn, body, raw });
+        let _ = self.0.send(Report::Event { turn, body: Box::new(body), raw });
     }
 
     pub fn notice(&self, turn: Option<u64>, text: impl Into<String>) {

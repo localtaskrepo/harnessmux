@@ -95,7 +95,9 @@ async fn call(registry: &Registry, table: &AgentTable, tool: &str, args: &Value)
             .await?;
             let outcome = match &end.body {
                 EventBody::TurnFinished { stop_reason, .. } => json!({"finished": stop_reason}),
-                EventBody::TurnFailed { error } => json!({"failed": error}),
+                EventBody::TurnFailed { error, kind, resets_at, retryable } => {
+                    json!({"failed": error, "kind": kind, "resets_at": resets_at, "retryable": retryable})
+                }
                 EventBody::SessionEnded { reason } => json!({"session_ended": reason}),
                 _ => Value::Null,
             };

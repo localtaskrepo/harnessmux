@@ -6,6 +6,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use crate::failure::{Failure, FailureKind};
+
 pub const EVENT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -48,6 +50,24 @@ pub struct Usage {
     pub context_size: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    /// The account's usage-limit window, when the agent reports it (claude-agent-acp's `_claude/rateLimit`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<RateLimit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RateLimit {
+    /// allowed, allowed_warning or rejected.
+    pub status: String,
+    /// The limit's window as the agent names it (Claude: five_hour, seven_day, overage, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+    /// RFC 3339 UTC time when the window resets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<String>,
+    /// How much of the window is used, 0 to 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub utilization: Option<f64>,
 }
 
 impl Usage {
@@ -155,13 +175,30 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Usage::is_empty")]
         usage: Usage,
     },
+    /// The turn failed. `raw` holds the agent's error when it sent one (an ACP JSON-RPC error).
     #[serde(rename = "turn.failed")]
-    TurnFailed { error: String },
+    TurnFailed {
+        error: String,
+        /// What the failure means ([`FailureKind`]): from the agent's error data, else from the text.
+        #[serde(default)]
+        kind: FailureKind,
+        /// RFC 3339 UTC time when the usage limit resets, when the agent says (rate_limited only).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resets_at: Option<String>,
+        /// Whether the same prompt can succeed later without anyone changing anything (after `resets_at`).
+        #[serde(default)]
+        retryable: bool,
+    },
     #[serde(rename = "session.ended")]
     SessionEnded { reason: String },
 }
 
 impl EventBody {
+    /// A `turn.failed` known only by its text; the kind comes from the text.
+    pub fn failed(error: impl Into<String>) -> Self {
+        Failure::from_text(error).into()
+    }
+
     /// Whether this event ends a turn.
     pub fn ends_turn(&self) -> bool {
         matches!(self, Self::TurnFinished { .. } | Self::TurnFailed { .. })
@@ -183,7 +220,7 @@ pub fn now() -> String {
     format_rfc3339(since.as_secs(), since.subsec_millis())
 }
 
-fn format_rfc3339(secs: u64, millis: u32) -> String {
+pub(crate) fn format_rfc3339(secs: u64, millis: u32) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).

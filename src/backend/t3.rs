@@ -25,7 +25,7 @@ use super::{Command, Report, Reporter, Start, refuse};
 use crate::agents::AgentSpec;
 use crate::error::{Error, Result};
 use crate::event;
-use crate::event::{EventBody, StopReason, Usage};
+use crate::event::{EventBody, Failure, FailureKind, StopReason, Usage};
 
 const POLL: Duration = Duration::from_secs(2);
 /// Failed `t3 thread show` reads in a row before following a run gives up.
@@ -109,7 +109,7 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
                     let error = format!(
                         "the previous owner stopped during a turn before it saved the T3 Code thread's id, and `t3 thread list` can't tell whether that turn made a thread ({why}); no thread is started, as it could be a second one. The next prompt looks again"
                     );
-                    reporter.event(Some(turn), EventBody::TurnFailed { error }, None);
+                    reporter.event(Some(turn), EventBody::failed(error), None);
                     unresolved = Some((since, why));
                     continue;
                 }
@@ -133,7 +133,7 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
                         return Ok(());
                     }
                 }
-                Err(error) => reporter.event(Some(turn), EventBody::TurnFailed { error: error.to_string() }, None),
+                Err(error) => reporter.event(Some(turn), EventBody::failed(error.to_string()), None),
             }
             continue;
         }
@@ -151,7 +151,7 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
                         return Ok(());
                     }
                 }
-                Err(error) => reporter.event(Some(turn), EventBody::TurnFailed { error: error.to_string() }, None),
+                Err(error) => reporter.event(Some(turn), EventBody::failed(error.to_string()), None),
             }
             continue;
         }
@@ -264,7 +264,7 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
         let body = match status.code() {
             Some(0) => finished(StopReason::EndTurn),
             Some(2) => waiting(&reporter, turn, &link),
-            _ => EventBody::TurnFailed { error: format!("t3 exited with {status}: {}", error_text.trim()) },
+            _ => EventBody::failed(format!("t3 exited with {status}: {}", error_text.trim())),
         };
         reporter.event(Some(turn), body, None);
     }
@@ -309,14 +309,14 @@ async fn follow_run(
                         Instant::now()
                     });
                     if since.elapsed() >= SERVER_WAIT {
-                        reporter.event(Some(turn), EventBody::TurnFailed { error: format!("the T3 Code server didn't answer for {} minutes; the thread {thread} may still run", SERVER_WAIT.as_secs() / 60) }, None);
+                        reporter.event(Some(turn), Failure::new(format!("the T3 Code server didn't answer for {} minutes; the thread {thread} may still run", SERVER_WAIT.as_secs() / 60), FailureKind::Transport).into(), None);
                         return true;
                     }
                 }
                 Shown::Unreadable => {
                     failed_reads += 1;
                     if failed_reads >= READ_ATTEMPTS {
-                        reporter.event(Some(turn), EventBody::TurnFailed { error: format!("could not read the T3 Code thread {thread} with `t3 thread show`") }, None);
+                        reporter.event(Some(turn), EventBody::failed(format!("could not read the T3 Code thread {thread} with `t3 thread show`")), None);
                         return true;
                     }
                 }
@@ -344,7 +344,7 @@ async fn follow_run(
     } else if state.status == "completed" {
         finished(StopReason::EndTurn)
     } else {
-        EventBody::TurnFailed { error: format!("the T3 Code thread's run ended with status '{}': {link}", state.status) }
+        EventBody::failed(format!("the T3 Code thread's run ended with status '{}': {link}", state.status))
     };
     reporter.event(Some(turn), body, None);
     true

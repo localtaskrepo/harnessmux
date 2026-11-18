@@ -117,7 +117,7 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
             reporter.event(Some(turn), EventBody::TurnFinished { stop_reason: StopReason::Cancelled, usage: Usage::default() }, None);
         } else if !ended {
             let error = format!("amp exited with {status} before finishing the turn: {}", stderr.trim());
-            reporter.event(Some(turn), EventBody::TurnFailed { error }, None);
+            reporter.event(Some(turn), EventBody::failed(error), None);
         }
     }
     Ok(())
@@ -155,7 +155,7 @@ fn map_line(value: &Value) -> Vec<EventBody> {
                 events.push(EventBody::Message { text: reply.clone() });
             }
             events.push(if failed {
-                EventBody::TurnFailed { error: if reply.is_empty() { "amp reported an error".into() } else { reply } }
+                EventBody::failed(if reply.is_empty() { "amp reported an error".into() } else { reply })
             } else {
                 EventBody::TurnFinished {
                     stop_reason: StopReason::EndTurn,

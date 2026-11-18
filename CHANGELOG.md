@@ -1,11 +1,21 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (unreleased)
 
+- `turn.failed` says what the failure means: `kind` (rate_limited, quota, auth_required, overloaded,
+  context_exhausted, transport, other), `resets_at` (when a usage limit resets) and `retryable`, and `raw` holds the
+  agent's JSON-RPC error. They come from claude-agent-acp's error data (`errorKind`, `rateLimit`), codex-acp's
+  (`codexErrorInfo`, whose `data.message` is now the error text, not "Internal error: {…}") and ACP's `authRequired`
+  code first, else from the error text. A library match on `EventBody::TurnFailed { error }` needs `..`
+  now, hence the minor version (lotar DEV-683).
+- `usage` carries Claude's usage-limit window as `rate_limit` (`status`, `window`, `resets_at`, `utilization`).
+- The replies "You've hit your limit · resets …" and "… 5-hour limit" or "… weekly limit" fail the turn like the other
+  limit texts.
 - A Codex turn that ends on Codex's own error text (model at capacity, high demand, policy-restricted or flex
   capacity unavailable, retry limit, stream cut off) is `turn.failed`, also after tools ran: codex-acp sends these as
   the turn's last message and `end_turn` (acpx #850). The turn's last chunk is checked too, so an error glued onto an
-  earlier message without a blank line also fails it (lotar DEV-691).
+  earlier message without a blank line also fails it (lotar DEV-691). Its `kind` is `overloaded`, `rate_limited` for
+  a 429 retry limit and `transport` for a cut-off stream (lotar DEV-683).
 - A denied permission request picks the option the agent table's new `reject` key names first. Codex gets `decline`
   ("continue without running it"), not `cancel`, which codex-acp also lists as `reject_once` and which can end the
   turn (lotar DEV-684).

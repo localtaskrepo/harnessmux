@@ -182,14 +182,20 @@ turn, `turn`; `raw` keeps the agent's own message it came from.
 | `tool.finished` | `id`, `status` (completed, failed) |
 | `permission.requested` | `request`, `title`, `options` (`id`, `name`, `kind`) |
 | `permission.answered` | `request`, `option`, `by` |
-| `usage` | `context_used`, `context_size`, `cost_usd` |
+| `usage` | `context_used`, `context_size`, `cost_usd`, `rate_limit` (`status`: allowed, allowed_warning, rejected; `window`, `resets_at`, `utilization`; claude only) |
 | `config.changed` | `option`, `value` |
 | `notice` | `text` |
 | `turn.finished` | `stop_reason` (end_turn, max_tokens, max_turn_requests, refusal, cancelled, waiting_for_answer), `usage` |
-| `turn.failed` | `error` |
+| `turn.failed` | `error`, `kind` (rate_limited, quota, auth_required, overloaded, context_exhausted, transport, other), `resets_at`, `retryable`; `raw` holds the agent's JSON-RPC error |
 | `session.ended` | `reason` (closed, idle, or the error) |
 
 New types and fields can appear within version 1; readers skip what they don't know.
+
+A failed turn's `kind` comes from the adapter's error data where it sends some (claude-agent-acp: `data.errorKind`,
+`data.rateLimit.resetsAt`, ACP's `authRequired` code; codex-acp: `data.codexErrorInfo`, with the reason in `data.message`), else from the error text ("You've hit your usage limit",
+"Not logged in", "Overloaded", …). Only the error data gives `resets_at`, an RFC 3339 UTC time; a reset time in the text
+is not read. `retryable` is true for rate_limited, overloaded and transport: the same prompt can succeed later (after
+`resets_at`) without anyone changing anything.
 
 ## Library
 

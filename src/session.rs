@@ -15,7 +15,7 @@ use crate::acp_map::ConfigOption;
 use crate::agents::AgentTable;
 use crate::backend::{self, Command, Report, Reporter};
 use crate::error::{Error, Result};
-use crate::event::{self, EVENT_VERSION, Event, EventBody};
+use crate::event::{self, EVENT_VERSION, Event, EventBody, Failure, FailureKind};
 use crate::ipc::{self, Reply, Request};
 use crate::profile::Profile;
 use crate::registry::{Registry, SessionRecord, SessionState};
@@ -344,7 +344,7 @@ impl Owner {
         if let Err(error) = &outcome
             && let Some(turn) = self.running.take()
         {
-            self.emit(Some(turn), EventBody::TurnFailed { error: error.clone() }, None);
+            self.emit(Some(turn), Failure::new(error.clone(), FailureKind::Transport).into(), None);
         }
         let reason = match (&outcome, closed) {
             (_, true) => "closed".to_string(),
@@ -494,6 +494,7 @@ impl Owner {
                 self.save();
             }
             Report::Event { turn, body, raw } => {
+                let body = *body;
                 match &body {
                     EventBody::PermissionRequested { .. } => self.waiting += 1,
                     EventBody::PermissionAnswered { .. } => self.waiting = self.waiting.saturating_sub(1),

@@ -209,6 +209,7 @@ fn a_codex_deny_declines_instead_of_cancelling_and_an_overloaded_turn_fails() {
     assert_eq!(run.status.code(), Some(1), "{}", text(&run));
     let failed = home.events("o1").into_iter().find(|e| e["type"] == "turn.failed").unwrap();
     assert!(failed["error"].as_str().unwrap().contains("at capacity"), "{failed}");
+    assert_eq!((&failed["kind"], &failed["retryable"]), (&"overloaded".into(), &true.into()), "{failed}");
 }
 
 #[test]
@@ -219,6 +220,7 @@ fn a_codex_error_glued_onto_an_earlier_message_fails_the_turn() {
     assert_eq!(run.status.code(), Some(1), "{}", text(&run));
     let failed = home.events("g1").into_iter().find(|e| e["type"] == "turn.failed").unwrap();
     assert_eq!(failed["error"], "Flex capacity unavailable.", "{failed}");
+    assert_eq!((&failed["kind"], &failed["retryable"]), (&"overloaded".into(), &true.into()), "{failed}");
 }
 
 #[test]
@@ -265,6 +267,50 @@ modes = { workspace = "acceptEdits" }"#,
     assert_eq!(failed.status.code(), Some(1), "{}", text(&failed));
     let last = home.events("p").into_iter().rev().find(|e| e["turn"] == 2 && e["type"] == "turn.failed").unwrap();
     assert!(last["error"].as_str().unwrap().contains("model_not_found"), "{last}");
+    assert_eq!((&last["kind"], &last["retryable"]), (&"other".into(), &false.into()), "{last}");
+}
+
+#[test]
+fn claude_limit_and_auth_errors_fail_the_turn_with_their_kind() {
+    // claude-agent-acp 0.107.0's shapes (result-end.ts, v2/outcome.ts): a usage limit fails the prompt with
+    // `data.errorKind` and `data.rateLimit`, a sign-in failure with ACP's authRequired (-32000).
+    let home = home(&[("rec", "claude-limit-then-auth.jsonl", "")]);
+    let limited = home.run(&["run", "rec", "--name", "l", "Fix add()"]);
+    assert_eq!(limited.status.code(), Some(1), "{}", text(&limited));
+    assert!(String::from_utf8_lossy(&limited.stderr).contains("resets at 2026-11-14T17:00:00.000Z"), "{}", text(&limited));
+    let events = home.events("l");
+    let usage = events.iter().find(|e| e["type"] == "usage").unwrap();
+    assert_eq!(
+        usage["rate_limit"],
+        serde_json::json!({"status": "rejected", "window": "five_hour", "resets_at": "2026-11-14T17:00:00.000Z", "utilization": 1.0})
+    );
+    let failed = events.iter().find(|e| e["type"] == "turn.failed").unwrap();
+    assert_eq!(failed["error"], "You've hit your limit · resets 6pm (Europe/Berlin)");
+    assert_eq!(
+        (&failed["kind"], &failed["resets_at"], &failed["retryable"]),
+        (&"rate_limited".into(), &"2026-11-14T17:00:00.000Z".into(), &true.into()),
+        "{failed}"
+    );
+    assert_eq!(failed["raw"]["data"]["errorKind"], "rate_limit");
+
+    let auth = home.run(&["send", "l", "--wait", "And now?"]);
+    assert_eq!(auth.status.code(), Some(1), "{}", text(&auth));
+    let failed = home.events("l").into_iter().rev().find(|e| e["turn"] == 2 && e["type"] == "turn.failed").unwrap();
+    assert_eq!((&failed["kind"], &failed["retryable"]), (&"auth_required".into(), &false.into()), "{failed}");
+    assert!(failed.get("resets_at").is_none(), "{failed}");
+}
+
+#[test]
+fn a_recorded_codex_usage_limit_replays_as_rate_limited() {
+    // codex-acp 2.6.0 sends the reason in `data.message` under the generic "Internal error" (live, 2026-11-16).
+    let home = home(&[("rec", "codex-usage-limit.jsonl", "")]);
+    let limited = home.run(&["run", "rec", "--name", "c", "Fix add()"]);
+    assert_eq!(limited.status.code(), Some(1), "{}", text(&limited));
+    let failed = home.events("c").into_iter().find(|e| e["type"] == "turn.failed").unwrap();
+    assert!(failed["error"].as_str().unwrap().starts_with("You’ve hit your usage limit."), "{failed}");
+    assert_eq!((&failed["kind"], &failed["retryable"]), (&"rate_limited".into(), &true.into()), "{failed}");
+    assert!(failed.get("resets_at").is_none(), "{failed}");
+    assert_eq!(failed["raw"]["data"]["codexErrorInfo"], "usageLimitExceeded");
 }
 
 #[test]

@@ -23,10 +23,10 @@ its design: lotar `docs/developers/harness-tool-design.md`.
 ## Rules
 - Tests never start a real agent: an agent's `command` points at `harnessmux replay <recording>`. A user `command`
   replaces the built-in pinned `adapter`; without that, a test named `claude` installed the real adapter (2026-11-13).
-- Recordings committed under tests/recordings are scrubbed: no `_meta`, no `auth/*` or `_*` notifications, no
+- Recordings committed under tests/recordings are scrubbed: no `_meta` but `_claude/rateLimit`, no `auth/*` or `_*` notifications, no
   `available_commands_update` (they hold the account's email and plan, and the owner's skills), paths as /work/repo.
 - Adapter versions and option ids live in agents.toml, not in code. Agents not run live stay `live = false` and say
   so in the README table.
 - An adapter error sent as an ordinary reply must end as `turn.failed` (acp_map::failure_in_reply); add the text
-  when a new adapter does this.
+  when a new adapter does this, and its kind to failure::TEXTS.
 - Event format: add types and fields freely; removing or changing one raises `EVENT_VERSION`.

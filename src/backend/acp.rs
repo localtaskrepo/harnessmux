@@ -21,7 +21,7 @@ use super::{Command, Report, Reporter, Start};
 use crate::acp_map::{self, ConfigOption};
 use crate::agents::AgentSpec;
 use crate::error::{Error, Result};
-use crate::event::{EventBody, PermissionOption, StopReason};
+use crate::event::{EventBody, Failure, PermissionOption, StopReason};
 use crate::profile::{McpServer, PermissionPolicy, Profile};
 use crate::replay::Recorder;
 
@@ -115,6 +115,14 @@ fn describe(error: &agent_client_protocol::Error) -> String {
     match serde_json::to_value(error).ok().and_then(|value| value.get("data").and_then(Value::as_str).map(str::to_string)) {
         Some(data) => data,
         None => error.to_string(),
+    }
+}
+
+/// A failed ACP request as a `turn.failed` and its raw JSON-RPC error.
+fn turn_failed(error: &agent_client_protocol::Error) -> (EventBody, Option<Value>) {
+    match serde_json::to_value(error) {
+        Ok(raw) => (Failure::from_acp_error(&raw).into(), Some(raw)),
+        Err(_) => (EventBody::failed(error.to_string()), None),
     }
 }
 
@@ -403,12 +411,15 @@ impl Driver {
             self.reporter.event(id, EventBody::Message { text: turn.reply.clone() }, None);
         }
         match done {
-            Err(error) => self.reporter.event(id, EventBody::TurnFailed { error: describe(&error) }, None),
+            Err(error) => {
+                let (body, raw) = turn_failed(&error);
+                self.reporter.event(id, body, raw);
+            }
             Ok(response) => {
                 let raw = json_of(&response);
                 let stop_reason: StopReason = raw.get("stopReason").cloned().and_then(|v| serde_json::from_value(v).ok()).unwrap_or(StopReason::EndTurn);
                 match acp_map::failure_in_reply(&turn.reply, &turn.last_chunk, turn.ran_tools) {
-                    Some(error) if stop_reason != StopReason::Cancelled => self.reporter.event(id, EventBody::TurnFailed { error }, Some(raw)),
+                    Some(error) if stop_reason != StopReason::Cancelled => self.reporter.event(id, EventBody::failed(error), Some(raw)),
                     _ => self.reporter.event(id, EventBody::TurnFinished { stop_reason, usage: acp_map::prompt_usage(&raw) }, Some(raw)),
                 }
             }
