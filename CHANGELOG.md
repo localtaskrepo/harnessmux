@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 (unreleased)
+## 0.2.0 (2026-11-20)
 
 - `turn.failed` says what the failure means: `kind` (rate_limited, quota, auth_required, overloaded,
   context_exhausted, transport, other), `resets_at` (when a usage limit resets) and `retryable`, and `raw` holds the
