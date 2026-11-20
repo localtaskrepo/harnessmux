@@ -2,7 +2,9 @@
 //! directory is a git worktree of its project, it is T3's MCP tool `t3_thread_launch` with that worktree
 //! (`existing_worktree`, full access), as T3's CLI can only make a new worktree. Later turns are `t3_thread_send`. Both
 //! carry a `clientRequestId` from the session (and the turn), so a retry never makes a second thread or run; the MCP
-//! sign-in is in [`super::t3_mcp`]. `t3 thread show --json` is polled to follow the run.
+//! sign-in is in [`super::t3_mcp`]. `t3 thread show --json` is polled to follow the run; a run that ends neither
+//! completed nor waiting fails the turn with the run's `error` items from the thread's activity (`t3_thread_read`), as
+//! `t3 thread show` has no error.
 //! The thread lives in T3 Code, so a session resumes by sending to it again; when the previous owner stopped during a
 //! turn, the first turn after the resume follows the thread's run instead, as that turn may still run. The record notes
 //! each `t3 thread start` until the new thread's id is saved; a session resumed without the id finds the thread by its
@@ -119,7 +121,7 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
             && let Some(id) = &thread
         {
             reporter.notice(Some(turn), "The previous owner stopped during a turn; this turn follows the T3 Code thread's run and doesn't send the prompt");
-            if !follow_run(&program, &start, id, turn, None, &mut follow, &mut commands, &reporter).await {
+            if !follow_run(&mut mcp, &cli, &program, &start, id, turn, None, &mut follow, &mut commands, &reporter).await {
                 return Ok(());
             }
             continue;
@@ -129,7 +131,7 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
             match call(&mut mcp, &cli, "t3_thread_send", arguments).await {
                 Ok(sent) => {
                     let run = sent.get("runId").and_then(Value::as_str);
-                    if !follow_run(&program, &start, &id, turn, run, &mut follow, &mut commands, &reporter).await {
+                    if !follow_run(&mut mcp, &cli, &program, &start, &id, turn, run, &mut follow, &mut commands, &reporter).await {
                         return Ok(());
                     }
                 }
@@ -147,7 +149,7 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
                     reporter.report(Report::AgentSession { id: id.clone(), adapter: None });
                     follow.link = launched.link;
                     reporter.event(None, started(&start, &id, "new", follow.link.clone()), None);
-                    if !follow_run(&program, &start, &id, turn, launched.run.as_deref(), &mut follow, &mut commands, &reporter).await {
+                    if !follow_run(&mut mcp, &cli, &program, &start, &id, turn, launched.run.as_deref(), &mut follow, &mut commands, &reporter).await {
                         return Ok(());
                     }
                 }
@@ -253,7 +255,7 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
             && still_going(&program, &start, id, &error_text).await
         {
             reporter.notice(Some(turn), format!("t3 exited with {status} while the thread goes on; this turn follows its run: {link}"));
-            if !follow_run(&program, &start, id, turn, None, &mut follow, &mut commands, &reporter).await {
+            if !follow_run(&mut mcp, &cli, &program, &start, id, turn, None, &mut follow, &mut commands, &reporter).await {
                 return Ok(());
             }
             continue;
@@ -275,6 +277,8 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
 /// when the session closes.
 #[expect(clippy::too_many_arguments, reason = "the run loop's state, passed down")]
 async fn follow_run(
+    mcp: &mut Option<Mcp>,
+    cli: &Cli,
     program: &std::path::Path,
     start: &Start,
     thread: &str,
@@ -346,10 +350,49 @@ async fn follow_run(
     } else if state.status == "completed" {
         finished(StopReason::EndTurn)
     } else {
-        EventBody::failed(format!("the T3 Code thread's run ended with status '{}': {link}", state.status))
+        let status = format!("the T3 Code thread's run ended with status '{}'", state.status);
+        match run_errors(mcp, cli, thread, state.run.as_deref()).await {
+            Ok(errors) if !errors.is_empty() => EventBody::failed(format!("{status}: {errors} ({link})")),
+            Ok(_) => EventBody::failed(format!("{status}: {link}")),
+            Err(error) => {
+                reporter.notice(Some(turn), format!("could not read the T3 Code thread's activity for its error: {error}"));
+                EventBody::failed(format!("{status}: {link}"))
+            }
+        }
     };
     reporter.event(Some(turn), body, None);
     true
+}
+
+/// The error items T3 Code's thread activity (`t3_thread_read`) holds for `run`, such as the provider's rate limit,
+/// as one text; `t3 thread show` has none. The newest items: without `beforePosition`, T3 gives a client outside a
+/// thread the oldest ones, which miss the error of a run that did some work first.
+async fn run_errors(mcp: &mut Option<Mcp>, cli: &Cli, thread: &str, run: Option<&str>) -> Result<String> {
+    // JavaScript's largest safe integer: after every item, as T3 Code needs a safe integer here.
+    const NEWEST: u64 = (1 << 53) - 1;
+    let arguments = json!({"threadId": thread, "view": "activity", "limit": 20, "maxCharsPerItem": 2000, "beforePosition": NEWEST});
+    let read = call(mcp, cli, "t3_thread_read", arguments).await?;
+    Ok(errors_of(&read, run))
+}
+
+fn errors_of(read: &Value, run: Option<&str>) -> String {
+    let errors: Vec<String> = read
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("error"))
+        .filter(|item| run.is_none_or(|run| item.get("runId").and_then(Value::as_str) == Some(run)))
+        .filter_map(|item| {
+            let field = |key: &str| item.get(key).and_then(Value::as_str).map(str::trim).filter(|text| !text.is_empty());
+            match (field("title"), field("text")) {
+                (Some(title), Some(text)) if !text.starts_with(title) => Some(format!("{title}: {text}")),
+                (_, Some(text)) => Some(text.to_string()),
+                (title, None) => title.map(str::to_string),
+            }
+        })
+        .collect();
+    errors.join("; ")
 }
 
 fn finished(stop_reason: StopReason) -> EventBody {

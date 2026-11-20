@@ -480,7 +480,9 @@ fn base64url(bytes: &[u8]) -> String {
 
 /// A fake T3 Code server for `dir`'s fake `t3`, with one project at `project`: the MCP OAuth sign-in (the pairing code
 /// `pair-1`, PKCE checked) and `/mcp`. `t3_thread_launch` returns thread t1 (the same thread for a repeated
-/// `clientRequestId`), or fails with the text in `launch-error`; `t3_thread_send` and the launch name run r2. Each
+/// `clientRequestId`), or fails with the text in `launch-error`; `t3_thread_send` and the launch name run r2;
+/// `t3_thread_read` pages the items in `activity.json` (none without it) as T3 Code does for a client outside a thread:
+/// the oldest `limit` without `beforePosition`, else the newest `limit` before it. Each
 /// sign-in step and tool call is appended to `calls` (`oauth token`, `mcp <tool> <arguments>`). Once `revoke` exists,
 /// the next `/mcp` request finds every token revoked (and removes the file). Returns the origin.
 #[cfg(unix)]
@@ -573,6 +575,19 @@ fn fake_t3_server(dir: &Path, project: &Path) -> String {
                                 }
                             },
                             "t3_thread_send" => Ok(thread(arguments["threadId"].as_str().unwrap())),
+                            "t3_thread_read" => {
+                                let items: Vec<serde_json::Value> =
+                                    std::fs::read_to_string(dir.join("activity.json")).map_or(Vec::new(), |a| serde_json::from_str(&a).unwrap());
+                                let limit = arguments["limit"].as_u64().map_or(20, |n| n as usize);
+                                let page = match arguments["beforePosition"].as_u64() {
+                                    None => &items[..limit.min(items.len())],
+                                    Some(before) => {
+                                        let end = (before as usize).min(items.len());
+                                        &items[end.saturating_sub(limit)..end]
+                                    }
+                                };
+                                Ok(serde_json::json!({"items": page}))
+                            }
                             _ => Ok(serde_json::json!({"sequence": 1})),
                         };
                         let result = match result {
@@ -953,6 +968,30 @@ fn a_t3_session_in_a_worktree_launches_its_thread_there_and_sends_later_turns_th
     assert!(other.status.success(), "{}", text(&other));
     assert_eq!(count_calls(&dir, "oauth token"), 1);
     assert_eq!(mcp_calls(&dir, "t3_thread_launch")[1]["title"], "x");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_t3_run_ends_the_turn_with_the_error_from_the_threads_activity() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    let worktree = git_worktree(&home);
+    show(&dir, "failed", "null", 0, "[]");
+    // T3 Code keeps a run's error as an `error` item of the thread's activity; `t3 thread show` has none. The run
+    // worked before it hit the limit, so its error is past the oldest 20 items.
+    let mut items = vec![serde_json::json!({"type": "error", "runId": "r1", "title": "Old", "text": "an earlier run's error"})];
+    items.extend((0..25).map(|n| serde_json::json!({"type": "command_execution", "runId": "r2", "text": format!("$ step {n}")})));
+    items.push(serde_json::json!({"type": "error", "runId": "r2", "status": "failed", "title": "Provider error", "text": "Claude API rate limit reached. Try again later."}));
+    std::fs::write(dir.join("activity.json"), serde_json::Value::from(items).to_string()).unwrap();
+    let run = home.run(&["run", "t3", "--name", "w", "--cwd", worktree.to_str().unwrap(), "Fix it"]);
+    assert!(!run.status.success(), "{}", text(&run));
+    let events = home.events("w");
+    let failed = events.iter().find(|e| e["type"] == "turn.failed").unwrap();
+    let error = failed["error"].as_str().unwrap();
+    assert!(error.contains("status 'failed': Provider error: Claude API rate limit reached. Try again later. (https://t3/t1)"), "{failed}");
+    assert!(!error.contains("earlier run"), "{failed}");
+    assert_eq!((&failed["kind"], &failed["retryable"]), (&"rate_limited".into(), &true.into()), "{failed}");
+    assert_eq!(mcp_calls(&dir, "t3_thread_read")[0]["view"], "activity");
 }
 
 #[cfg(unix)]

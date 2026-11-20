@@ -8,6 +8,9 @@
   (`codexErrorInfo`, whose `data.message` is now the error text, not "Internal error: {…}") and ACP's `authRequired`
   code first, else from the error text. A library match on `EventBody::TurnFailed { error }` needs `..`
   now, hence the minor version (lotar DEV-683).
+- A t3 run that fails ends `turn.failed` with T3 Code's error for it (the provider's rate or usage limit, a worktree
+  T3 couldn't recreate), read from the thread's activity with `t3_thread_read`, so its `kind` is typed too; before, it
+  said only that the run ended with status 'failed' (HARN-2).
 - `usage` carries Claude's usage-limit window as `rate_limit` (`status`, `window`, `resets_at`, `utilization`).
 - The replies "You've hit your limit · resets …" and "… 5-hour limit" or "… weekly limit" fail the turn like the other
   limit texts.
