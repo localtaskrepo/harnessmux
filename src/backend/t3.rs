@@ -287,6 +287,8 @@ async fn follow_run(
     let mut poll = tokio::time::interval(POLL);
     let mut failed_reads = 0;
     let mut unreachable_since: Option<Instant> = None;
+    // Once T3 shows `run`, a later run is its resumption (after a background task) and is followed too.
+    let mut current = run.is_none();
     let shown = loop {
         tokio::select! {
             _ = poll.tick() => match show(program, start, thread).await {
@@ -297,7 +299,7 @@ async fn follow_run(
                         reporter.event(Some(turn), EventBody::MessageDelta { text: message }, None);
                     }
                     let state = RunState::of(&shown);
-                    let current = run.is_none_or(|run| state.run.as_deref() == Some(run));
+                    current = current || state.run.as_deref() == run;
                     if current && (!state.running || state.waiting) {
                         break shown;
                     }
@@ -521,13 +523,12 @@ impl RunState {
             .map(str::trim)
             .filter(|text| !text.is_empty())
             .map(str::to_string);
-        Self {
-            run: run.map(str::to_string),
-            running: matches!(status.as_str(), "running" | "starting") || active,
-            waiting: thread.and_then(|t| t.get("pendingRequestCount")).and_then(Value::as_u64).is_some_and(|count| count > 0),
-            status,
-            reply,
-        }
+        let waiting = thread.and_then(|t| t.get("pendingRequestCount")).and_then(Value::as_u64).is_some_and(|count| count > 0);
+        // A run that ended waiting on its own background task or on another thread: T3 Code resumes it on its own.
+        let resumes = status == "waiting"
+            && (thread.and_then(|t| t.get("pendingBackgroundTasks")).and_then(Value::as_array).is_some_and(|tasks| !tasks.is_empty())
+                || thread.and_then(|t| t.get("blockedOnThreadWait")).and_then(Value::as_bool) == Some(true));
+        Self { run: run.map(str::to_string), running: matches!(status.as_str(), "running" | "starting") || active || resumes, waiting, status, reply }
     }
 }
 
@@ -745,5 +746,13 @@ mod tests {
         ]}));
         assert!(!done.running && !done.waiting);
         assert_eq!((done.status.as_str(), done.reply.as_deref()), ("completed", Some("Done")));
+        let background = |tasks: Value, blocked: bool| {
+            RunState::of(&json!({"thread": {"status": "waiting", "activeRunId": null, "latestRunId": "r2", "pendingRequestCount": 0,
+                "pendingBackgroundTasks": tasks, "blockedOnThreadWait": blocked}, "messages": []}))
+        };
+        assert!(background(json!([{"taskId": "b1"}]), false).running);
+        assert!(background(json!([]), true).running);
+        let stalled = background(json!([]), false);
+        assert!(!stalled.running && !stalled.waiting);
     }
 }

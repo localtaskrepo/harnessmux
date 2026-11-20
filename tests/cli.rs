@@ -696,6 +696,39 @@ fn a_t3_session_whose_owner_died_mid_turn_follows_the_thread_run_instead_of_send
 
 #[cfg(unix)]
 #[test]
+fn a_t3_thread_waiting_on_its_own_background_task_keeps_the_turn_running() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    std::fs::write(dir.join("start-exit"), "0").unwrap();
+    show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r1","text":"Started."}]"#);
+    let first = home.run(&["run", "t3", "--name", "b", "--provider", "claudeAgent", "--model", "m", "Start"]);
+    assert!(first.status.success(), "{}", text(&first));
+
+    // The agent ended its run with t3_background_wait on a build: T3 Code resumes it when the build ends (HARN-3).
+    let waiting = r#"{"thread":{"threadId":"t1","link":"https://t3/t1","status":"waiting","activeRunId":null,"latestRunId":"r2","pendingRequestCount":0,
+        "blockedOnThreadWait":false,"pendingBackgroundTasks":[{"taskId":"b1"}]},"messages":[{"role":"assistant","runId":"r2","text":"Waiting for the build."}]}"#;
+    std::fs::write(dir.join("show.json"), waiting).unwrap();
+    let wait = home.cmd(&["send", "b", "--wait", "Build it"]).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    home.wait_for("b", "message.delta");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!home.events("b").iter().any(|e| e["type"] == "turn.failed"), "{:?}", home.events("b"));
+
+    show(
+        &dir,
+        "completed",
+        "null",
+        0,
+        r#"[{"role":"assistant","runId":"r2","text":"Waiting for the build."},{"role":"assistant","runId":"r2","text":"Built."}]"#,
+    );
+    let waited = home.finish(wait, &["send", "b", "--wait", "Build it"]);
+    assert!(waited.status.success(), "{}", text(&waited));
+    let events = home.events("b");
+    assert!(!events.iter().any(|e| e["type"] == "turn.failed"), "{events:?}");
+    assert_eq!(events.iter().rfind(|e| e["type"] == "turn.finished").unwrap()["stop_reason"], "end_turn", "{events:?}");
+}
+
+#[cfg(unix)]
+#[test]
 fn a_wait_whose_owner_dies_mid_turn_ends_with_an_error() {
     let home = home(&[]);
     let dir = fake_t3(&home);

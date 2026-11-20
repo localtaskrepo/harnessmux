@@ -23,6 +23,9 @@
   `net.pyxzl.harnessmux`, hardened runtime) with `HARNESSMUX_SIGNING_IDENTITY` or the maintainer's Developer ID, so
   keychain and firewall grants survive a new build (lotar DEV-564). `cargo install --git` now needs the package name
   (`... harnessmux`): the repository is a workspace with the unpublished `xtask`.
+- A t3 turn whose thread waits on its own background task or another thread (status `waiting`, a non-empty
+  `pendingBackgroundTasks` or `blockedOnThreadWait`, no question pending) keeps running until T3 Code resumes and ends
+  the run, also as a new run, instead of failing with "ended with status 'waiting'" (HARN-3).
 
 ## 0.1.10 (2026-11-17)
 
