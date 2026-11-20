@@ -729,6 +729,45 @@ fn a_t3_thread_waiting_on_its_own_background_task_keeps_the_turn_running() {
 
 #[cfg(unix)]
 #[test]
+fn a_t3_run_resumed_under_a_new_run_id_is_followed_to_its_end() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    std::fs::write(dir.join("start-exit"), "0").unwrap();
+    show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r1","text":"Started."}]"#);
+    let first = home.run(&["run", "t3", "--name", "r", "--provider", "claudeAgent", "--model", "m", "Start"]);
+    assert!(first.status.success(), "{}", text(&first));
+
+    // The sent run r2 waits on its background task; T3 Code resumes it as run r3 (HARN-4).
+    let thread = |status: &str, active: &str, latest: &str, tasks: &str, messages: &str| {
+        let json = format!(
+            r#"{{"thread":{{"threadId":"t1","link":"https://t3/t1","status":"{status}","activeRunId":{active},"latestRunId":"{latest}","pendingRequestCount":0,"blockedOnThreadWait":false,"pendingBackgroundTasks":{tasks}}},"messages":{messages}}}"#
+        );
+        std::fs::write(dir.join("show.json"), json).unwrap();
+    };
+    let r2 = r#"{"role":"assistant","runId":"r2","text":"Waiting for the build."}"#;
+    thread("waiting", "null", "r2", r#"[{"taskId":"b1"}]"#, &format!("[{r2}]"));
+    let wait = home.cmd(&["send", "r", "--wait", "Build it"]).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    home.wait_for("r", "message.delta");
+    std::thread::sleep(Duration::from_millis(500));
+
+    let r3 = r#"{"role":"assistant","runId":"r3","text":"Testing."}"#;
+    thread("running", "\"r3\"", "r3", "[]", &format!("[{r2},{r3}]"));
+    std::thread::sleep(Duration::from_millis(500));
+    let ended = |e: &Value| e["type"] == "turn.failed" || (e["type"] == "turn.finished" && e["turn"] == 2);
+    assert!(!home.events("r").iter().any(ended), "{:?}", home.events("r"));
+
+    thread("completed", "null", "r3", "[]", &format!(r#"[{r2},{r3},{{"role":"assistant","runId":"r3","text":"Built."}}]"#));
+    let waited = home.finish(wait, &["send", "r", "--wait", "Build it"]);
+    assert!(waited.status.success(), "{}", text(&waited));
+    assert!(String::from_utf8_lossy(&waited.stdout).contains("Built."), "{}", text(&waited));
+    let events = home.events("r");
+    assert!(!events.iter().any(|e| e["type"] == "turn.failed"), "{events:?}");
+    assert_eq!(events.iter().rfind(|e| e["type"] == "message").unwrap()["text"], "Built.", "{events:?}");
+    assert_eq!(events.iter().rfind(|e| e["type"] == "turn.finished").unwrap()["stop_reason"], "end_turn", "{events:?}");
+}
+
+#[cfg(unix)]
+#[test]
 fn a_wait_whose_owner_dies_mid_turn_ends_with_an_error() {
     let home = home(&[]);
     let dir = fake_t3(&home);
