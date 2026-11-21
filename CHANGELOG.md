@@ -9,6 +9,8 @@
   codex-acp's terminal output chunks, for Amp from its `tool_result`. A `plan` update is a `plan` event with
   `entries` (`content`, `status`, `priority`). The event format stays version 1. A library match on
   `EventBody::ToolStarted` or `EventBody::ToolFinished` without `..` needs it now, hence the minor version (HARN-14).
+- `harnessmux run` and `attach` without `--json` print a running tool's new title from `tool.updated` as another
+  `· <title>` line, so a Claude Bash call shows its command, not only "Terminal" (HARN-18).
 
 ## 0.2.1 (2026-11-21)
 

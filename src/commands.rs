@@ -431,11 +431,13 @@ struct Printer {
     color: bool,
     /// Turns whose reply was printed from deltas; the others print the whole `message`.
     streamed: std::collections::BTreeSet<(String, u64)>,
+    /// The title printed last for each running tool, by session and tool id: a `tool.updated` prints only a new one.
+    tool_titles: BTreeMap<(String, String), String>,
 }
 
 impl Printer {
     fn new(json: bool) -> Self {
-        Self { json, mid_line: false, color: std::io::stderr().is_terminal(), streamed: Default::default() }
+        Self { json, mid_line: false, color: std::io::stderr().is_terminal(), streamed: Default::default(), tool_titles: Default::default() }
     }
 
     fn note(&mut self, text: &str) {
@@ -463,8 +465,21 @@ impl Printer {
                 let _ = std::io::stdout().flush();
                 self.mid_line = !text.ends_with('\n');
             }
-            EventBody::ToolStarted { title, .. } => self.note(&format!("· {title}")),
-            EventBody::ToolFinished { status, title, .. } if status == "failed" => self.note(&format!("✗ {}", title.as_deref().unwrap_or("tool failed"))),
+            EventBody::ToolStarted { id, title, .. } => {
+                self.tool_titles.insert((event.session.clone(), id.clone()), title.clone());
+                self.note(&format!("· {title}"));
+            }
+            EventBody::ToolUpdated { id, title: Some(title), .. } if !title.is_empty() => {
+                if self.tool_titles.insert((event.session.clone(), id.clone()), title.clone()).as_ref() != Some(title) {
+                    self.note(&format!("· {title}"));
+                }
+            }
+            EventBody::ToolFinished { id, status, title, .. } => {
+                self.tool_titles.remove(&(event.session.clone(), id.clone()));
+                if status == "failed" {
+                    self.note(&format!("✗ {}", title.as_deref().unwrap_or("tool failed")));
+                }
+            }
             EventBody::PermissionRequested { request, title, options } => {
                 let ids = options.iter().map(|o| format!("{} ({})", o.id, o.kind)).collect::<Vec<_>>().join(", ");
                 self.note(&format!("? {request}: {title} — harnessmux answer {} {request} <{ids}>", event.session));

@@ -242,6 +242,9 @@ fn claude_tool_calls_carry_their_command_paths_output_and_the_plan() {
     let plan = events.iter().find(|e| e["type"] == "plan").unwrap();
     assert_eq!(plan["entries"][0], serde_json::json!({"content": "Fix add()", "status": "in_progress", "priority": "medium"}), "{plan}");
     assert_eq!(plan["entries"].as_array().unwrap().len(), 2);
+    // Without --json the CLI prints the command from the update, once.
+    let tools: Vec<&str> = std::str::from_utf8(&run.stderr).unwrap().lines().filter(|l| l.starts_with("· ")).collect();
+    assert_eq!(tools, ["· Terminal", "· cargo test", "· Read /work/repo/calc.py"], "{}", text(&run));
 }
 
 #[test]
@@ -256,6 +259,8 @@ fn codex_tool_calls_carry_their_command_and_the_joined_terminal_output() {
     assert!(!events.iter().any(|e| e["type"] == "tool.updated"), "{events:#?}");
     let finished = events.iter().find(|e| e["type"] == "tool.finished").unwrap();
     assert_eq!((&finished["status"], &finished["output"]), (&"failed".into(), &"running 1 test\ntest add ... FAILED\n".into()), "{finished}");
+    let tools: Vec<&str> = std::str::from_utf8(&run.stderr).unwrap().lines().filter(|l| l.starts_with("· ")).collect();
+    assert_eq!(tools, ["· cargo test"], "{}", text(&run));
 }
 
 #[test]
