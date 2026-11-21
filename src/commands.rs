@@ -11,7 +11,7 @@ use harnessmux::follow::Follower;
 use harnessmux::ipc::{self, Request};
 use harnessmux::profile::parse_mcp_file;
 use harnessmux::{
-    AgentTable, Error, Event, EventBody, Profile, Registry, Result, Rules, Session, SessionState, StartOptions, capabilities, event, mcp, replay,
+    AgentTable, Error, Event, EventBody, Profile, Registry, Result, Rules, Session, SessionRecord, SessionState, StartOptions, capabilities, event, mcp, replay,
 };
 use tokio::io::AsyncBufReadExt as _;
 
@@ -176,7 +176,7 @@ pub async fn dispatch(command: Command) -> Result<u8> {
             client::ensure_owner(&registry, &name).await?;
             simple(&registry, &name, Request::Set { option, value }).await
         }
-        Command::List { json, project } => list(&registry, json, project),
+        Command::List { json, project } => list(&registry, json, project).await,
         Command::Status { name, json } => status(&registry, &name, json).await,
         Command::Close { name, forget } => close(&registry, &name, forget).await,
         Command::Settle { name } => {
@@ -276,31 +276,53 @@ fn project_of(arg: &ProjectArg) -> Result<Option<PathBuf>> {
         .transpose()
 }
 
-fn list(registry: &Registry, json: bool, project: ProjectArg) -> Result<u8> {
+async fn list(registry: &Registry, json: bool, project: ProjectArg) -> Result<u8> {
     let project = project_of(&project)?;
-    let records = registry.list(project.as_deref())?;
+    let mut sessions = Vec::new();
+    for record in registry.list(project.as_deref())? {
+        let gone = owner_gone(registry, &record).await;
+        sessions.push((record, gone));
+    }
     if json {
-        println!("{}", serde_json::to_string(&records).map_err(|error| Error::Invalid(error.to_string()))?);
+        let values: Vec<_> = sessions.iter().map(|(record, gone)| record_json(record, *gone)).collect();
+        println!("{}", serde_json::to_string(&values).map_err(|error| Error::Invalid(error.to_string()))?);
         return Ok(0);
     }
-    for record in records {
+    for (record, gone) in sessions {
         let project = record.project.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "-".into());
-        println!("{}\t{}\t{}\t{}\t{}", record.name, record.agent, record.state.as_str(), project, record.last_used);
+        let state = if gone { "interrupted" } else { record.state.as_str() };
+        println!("{}\t{}\t{}\t{}\t{}", record.name, record.agent, state, project, record.last_used);
     }
     Ok(0)
+}
+
+/// Whether the record says a turn runs or waits but no owner answers: it was killed before it could save its state
+/// (HARN-20). The record stays as it is, as `resume` needs it.
+async fn owner_gone(registry: &Registry, record: &SessionRecord) -> bool {
+    matches!(record.state, SessionState::Running | SessionState::Waiting) && !ipc::owner_running(registry, &record.name).await
+}
+
+/// The record as JSON, with `"owner_alive": false` when its owner is gone.
+fn record_json(record: &SessionRecord, gone: bool) -> serde_json::Value {
+    let mut value = serde_json::to_value(record).unwrap_or_default();
+    if let (true, Some(object)) = (gone, value.as_object_mut()) {
+        object.insert("owner_alive".into(), false.into());
+    }
+    value
 }
 
 async fn status(registry: &Registry, name: &str, json: bool) -> Result<u8> {
     let record = registry.load(name)?;
     let value = match ipc::request(registry, name, &Request::Status).await.and_then(ipc::Reply::into_result) {
         Ok(reply) => serde_json::to_value(reply.status).unwrap_or_default(),
-        Err(_) => serde_json::to_value(&record).unwrap_or_default(),
+        Err(_) => record_json(&record, matches!(record.state, SessionState::Running | SessionState::Waiting)),
     };
     if json {
         println!("{value}");
     } else {
         let text = |key: &str| value.get(key).and_then(|v| v.as_str()).unwrap_or("-").to_string();
-        println!("{name}: {} ({}) in {}", text("state"), text("agent"), text("cwd"));
+        let state = if value.get("owner_alive") == Some(&false.into()) { "interrupted".into() } else { text("state") };
+        println!("{name}: {state} ({}) in {}", text("agent"), text("cwd"));
         println!("agent session: {}", text("agent_session"));
         if let Some(options) = value.get("options").and_then(|v| v.as_array()) {
             for option in options {

@@ -11,6 +11,9 @@
   `EventBody::ToolStarted` or `EventBody::ToolFinished` without `..` needs it now, hence the minor version (HARN-14).
 - `harnessmux run` and `attach` without `--json` print a running tool's new title from `tool.updated` as another
   `· <title>` line, so a Claude Bash call shows its command, not only "Terminal" (HARN-18).
+- `harnessmux list` and `status` show a running or waiting session whose owner process is gone (killed before it
+  saved its state) as `interrupted`; `--json` keeps the recorded `state` and adds `"owner_alive": false`. Before,
+  such a session kept showing `running` (HARN-20).
 
 ## 0.2.1 (2026-11-21)
 

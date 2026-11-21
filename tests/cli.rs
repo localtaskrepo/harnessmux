@@ -865,6 +865,52 @@ fn a_wait_whose_owner_dies_mid_turn_ends_with_an_error() {
     assert!(String::from_utf8_lossy(&waited.stderr).contains("the owner of d stopped during turn 2"), "{}", text(&waited));
 }
 
+#[cfg(unix)]
+#[test]
+fn list_and_status_show_a_running_session_whose_owner_died_as_interrupted() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    std::fs::write(dir.join("start-exit"), "0").unwrap();
+    show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r1","text":"Started."}]"#);
+    let first = home.run(&["run", "t3", "--name", "i", "--provider", "claudeAgent", "--model", "m", "Start"]);
+    assert!(first.status.success(), "{}", text(&first));
+    show(&dir, "running", "\"r2\"", 0, r#"[{"role":"assistant","runId":"r2","text":"Working."}]"#);
+    assert!(home.run(&["send", "i", "Go on"]).status.success());
+    home.wait_for("i", "message.delta");
+
+    let listed = |home: &Home| -> (String, Value) {
+        let text = String::from_utf8(home.run(&["list"]).stdout).unwrap();
+        let json: Vec<Value> = serde_json::from_slice(&home.run(&["list", "--json"]).stdout).unwrap();
+        (text, json.into_iter().find(|s| s["name"] == "i").unwrap())
+    };
+    let status = |home: &Home| -> (String, Value) {
+        let text = String::from_utf8(home.run(&["status", "i"]).stdout).unwrap();
+        (text, serde_json::from_slice(&home.run(&["status", "i", "--json"]).stdout).unwrap())
+    };
+
+    // A live owner: as before, no owner_alive.
+    let (text, json) = listed(&home);
+    assert!(text.starts_with("i\tt3\trunning\t"), "{text}");
+    assert_eq!(json["state"], "running");
+    assert!(json.get("owner_alive").is_none(), "{json}");
+    let (text, json) = status(&home);
+    assert!(text.starts_with("i: running (t3)"), "{text}");
+    assert!(json.get("owner_alive").is_none(), "{json}");
+
+    home.kill_owner("i");
+    let (text, json) = listed(&home);
+    assert!(text.starts_with("i\tt3\tinterrupted\t"), "{text}");
+    assert_eq!(json["state"], "running", "{json}");
+    assert_eq!(json["owner_alive"], false, "{json}");
+    let (text, json) = status(&home);
+    assert!(text.starts_with("i: interrupted (t3)"), "{text}");
+    assert_eq!(json["state"], "running", "{json}");
+    assert_eq!(json["owner_alive"], false, "{json}");
+    // The record keeps its state for resume.
+    let record: Value = serde_json::from_str(&std::fs::read_to_string(home.dir.path().join("state/sessions/i.json")).unwrap()).unwrap();
+    assert_eq!(record["state"], "running", "{record}");
+}
+
 /// Session `n` with title "DEV-1 Fix" whose owner died in its first turn after `thread start` made t1 and before it
 /// saved t1's id: the record notes when the thread was asked for, not its id. `list.json` lists t1 as made then.
 /// Returns the record's path.

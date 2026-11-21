@@ -56,7 +56,7 @@ harnessmux close fix-calc
 | `cancel <name>` | Cancel the running turn and drop queued prompts. |
 | `answer <name> <request> <option>` | Answer a permission request (with `--on-permission ask`). |
 | `set <name> <option> <value>` | Set one of the agent's config options; `status` lists them. |
-| `list`, `status <name>`, `close <name>` | Sessions; one session's state, agent session id and options; end a session. |
+| `list`, `status <name>`, `close <name>` | Sessions; one session's state, agent session id and options; end a session. A running or waiting session whose owner process is gone shows as `interrupted` (`--json`: `state` as recorded, `"owner_alive": false`); `send` resumes it. |
 | `settle <name>` | t3: move the session's thread to T3 Code's Settled group when its last run finished and it doesn't wait for an answer; prints the link. |
 | `capabilities [agent]` | The agents, whether they are installed, their adapters; with an agent, start it and list what it offers. |
 | `mcp` | An MCP server on stdio with tools to start, send to, wait for, cancel and close child sessions. |
