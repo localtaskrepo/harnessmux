@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.1 (2026-11-21)
 
 - A t3 session with a provider and model starts its thread at the profile's effort and `options`, as T3 Code's model
   options (`t3 thread start --option effort=high`, `modelSelection.options` for a thread in a worktree); an `effort`
