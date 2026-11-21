@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::event::{EventBody, Usage};
+use crate::event::{EventBody, OUTPUT_LIMIT, PlanEntry, Usage};
 
 fn str_at<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
@@ -14,22 +14,57 @@ pub fn map_update(update: &Value) -> Vec<EventBody> {
     let kind = str_at(update, "sessionUpdate").unwrap_or_default();
     let text =
         || update.get("content").filter(|content| str_at(content, "type") == Some("text")).and_then(|content| str_at(content, "text")).map(str::to_string);
+    let id = || str_at(update, "toolCallId").unwrap_or_default().to_string();
     match kind {
         "agent_message_chunk" => text().map(|text| EventBody::MessageDelta { text }).into_iter().collect(),
         "agent_thought_chunk" => text().map(|text| EventBody::ThoughtDelta { text }).into_iter().collect(),
         "tool_call" => vec![EventBody::ToolStarted {
-            id: str_at(update, "toolCallId").unwrap_or_default().to_string(),
+            id: id(),
             title: str_at(update, "title").unwrap_or("tool").to_string(),
             kind: str_at(update, "kind").map(str::to_string),
+            input: tool_input(update),
+            locations: tool_locations(update),
         }],
-        "tool_call_update" => match str_at(update, "status") {
-            Some(status @ ("completed" | "failed")) => vec![EventBody::ToolFinished {
-                id: str_at(update, "toolCallId").unwrap_or_default().to_string(),
-                status: status.to_string(),
-                title: str_at(update, "title").map(str::to_string),
-            }],
-            _ => Vec::new(),
-        },
+        "tool_call_update" => {
+            let (input, locations) = (tool_input(update), tool_locations(update));
+            let title = str_at(update, "title").map(str::to_string);
+            match str_at(update, "status") {
+                Some(status @ ("completed" | "failed")) => {
+                    // An adapter that sends the input only with the result: keep it before the result.
+                    let updated = (input.is_some() || !locations.is_empty()).then(|| EventBody::ToolUpdated {
+                        id: id(),
+                        title: None,
+                        kind: str_at(update, "kind").map(str::to_string),
+                        input,
+                        locations,
+                    });
+                    let finished =
+                        EventBody::ToolFinished { id: id(), status: status.to_string(), title, output: tool_output(update).map(|text| cap_output(&text, 0)) };
+                    updated.into_iter().chain([finished]).collect()
+                }
+                _ => {
+                    let kind = str_at(update, "kind").map(str::to_string);
+                    if input.is_none() && locations.is_empty() && title.is_none() && kind.is_none() {
+                        Vec::new()
+                    } else {
+                        vec![EventBody::ToolUpdated { id: id(), title, kind, input, locations }]
+                    }
+                }
+            }
+        }
+        "plan" => {
+            let entries = update.get("entries").and_then(Value::as_array).into_iter().flatten();
+            let entries = entries
+                .filter_map(|entry| {
+                    Some(PlanEntry {
+                        content: str_at(entry, "content")?.to_string(),
+                        status: str_at(entry, "status").unwrap_or_default().to_string(),
+                        priority: str_at(entry, "priority").unwrap_or_default().to_string(),
+                    })
+                })
+                .collect();
+            vec![EventBody::Plan { entries }]
+        }
         "usage_update" => {
             let cost = update.get("cost").filter(|cost| str_at(cost, "currency").is_none_or(|currency| currency == "USD"));
             let usage = Usage {
@@ -44,10 +79,58 @@ pub fn map_update(update: &Value) -> Vec<EventBody> {
         "current_mode_update" => {
             str_at(update, "currentModeId").map(|value| EventBody::ConfigChanged { option: "mode".into(), value: value.into() }).into_iter().collect()
         }
-        // History replayed by session/load, plans, command lists, titles and the rest carry nothing a caller acts on;
+        // History replayed by session/load, command lists, titles and the rest carry nothing a caller acts on;
         // they stay in the raw ACP log.
         _ => Vec::new(),
     }
+}
+
+/// A tool call's `rawInput`; none when it is empty (claude-agent-acp's first `tool_call` has `{}`).
+fn tool_input(update: &Value) -> Option<Value> {
+    update.get("rawInput").filter(|input| !input.is_null() && input.as_object().is_none_or(|map| !map.is_empty())).cloned()
+}
+
+/// The paths of a tool call's `locations`.
+fn tool_locations(update: &Value) -> Vec<String> {
+    update.get("locations").and_then(Value::as_array).into_iter().flatten().filter_map(|location| str_at(location, "path")).map(str::to_string).collect()
+}
+
+/// A finished tool's output: its text `content` items, else `rawOutput` (a string, or other JSON as compact JSON).
+fn tool_output(update: &Value) -> Option<String> {
+    let texts: Vec<&str> = update
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| str_at(item, "type") == Some("content"))
+        .filter_map(|item| item.get("content").filter(|block| str_at(block, "type") == Some("text")).and_then(|block| str_at(block, "text")))
+        .collect();
+    let output = if texts.is_empty() {
+        match update.get("rawOutput") {
+            None | Some(Value::Null) => return None,
+            Some(Value::String(text)) => text.clone(),
+            Some(other) => other.to_string(),
+        }
+    } else {
+        texts.join("\n")
+    };
+    (!output.trim().is_empty()).then_some(output)
+}
+
+/// A chunk of a running command's output (codex-acp's `_meta.terminal_output_delta`).
+pub fn terminal_output(update: &Value) -> Option<&str> {
+    update.get("_meta").and_then(|meta| meta.get("terminal_output_delta")).and_then(|delta| str_at(delta, "data"))
+}
+
+/// `text` cut to [`OUTPUT_LIMIT`] bytes on a character boundary; a cut, or `dropped` bytes left out before, end it
+/// with `… [N more bytes]`.
+pub fn cap_output(text: &str, dropped: usize) -> String {
+    let mut end = text.len().min(OUTPUT_LIMIT);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let more = text.len() - end + dropped;
+    if more == 0 { text.to_string() } else { format!("{}… [{more} more bytes]", &text[..end]) }
 }
 
 /// Token counts from a `session/prompt` result's `usage`.
@@ -203,15 +286,36 @@ mod tests {
     fn updates_become_events() {
         let chunk = json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Hi"}});
         assert_eq!(map_update(&chunk), [EventBody::MessageDelta { text: "Hi".into() }]);
-        let tool = json!({"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "Read a.rs", "kind": "read", "status": "pending"});
-        assert_eq!(map_update(&tool), [EventBody::ToolStarted { id: "t1".into(), title: "Read a.rs".into(), kind: Some("read".into()) }]);
+        let tool = json!({"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "Read a.rs", "kind": "read", "status": "pending", "rawInput": {}});
+        let started = EventBody::ToolStarted { id: "t1".into(), title: "Read a.rs".into(), kind: Some("read".into()), input: None, locations: Vec::new() };
+        assert_eq!(map_update(&tool), [started]);
         let running = json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "in_progress"});
         assert!(map_update(&running).is_empty());
+        let paths = json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1", "locations": [{"path": "a.rs"}, {"line": 3}], "rawInput": null});
+        let updated = EventBody::ToolUpdated { id: "t1".into(), title: None, kind: None, input: None, locations: vec!["a.rs".into()] };
+        assert_eq!(map_update(&paths), [updated]);
         let done = json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "failed"});
-        assert_eq!(map_update(&done), [EventBody::ToolFinished { id: "t1".into(), status: "failed".into(), title: None }]);
+        assert_eq!(map_update(&done), [EventBody::ToolFinished { id: "t1".into(), status: "failed".into(), title: None, output: None }]);
+        // The input only with the result: kept as an update before it. JSON output that isn't text: compact JSON.
+        let late = json!({"sessionUpdate": "tool_call_update", "toolCallId": "t2", "status": "completed", "rawInput": {"q": 1}, "rawOutput": {"n": 2}});
+        let events: [EventBody; 2] = map_update(&late).try_into().unwrap();
+        let [EventBody::ToolUpdated { input, .. }, EventBody::ToolFinished { output, .. }] = events else { panic!("{events:?}") };
+        assert_eq!((input, output.as_deref()), (Some(json!({"q": 1})), Some(r#"{"n":2}"#)));
+        let cleared = json!({"sessionUpdate": "plan", "entries": []});
+        assert_eq!(map_update(&cleared), [EventBody::Plan { entries: Vec::new() }]);
         let usage = json!({"sessionUpdate": "usage_update", "used": 10, "size": 200, "cost": {"amount": 0.5, "currency": "USD"}});
         assert_eq!(map_update(&usage), [EventBody::Usage(Usage { context_used: Some(10), context_size: Some(200), cost_usd: Some(0.5), ..Usage::default() })]);
         assert!(map_update(&json!({"sessionUpdate": "available_commands_update"})).is_empty());
+    }
+
+    #[test]
+    fn long_output_is_cut_on_a_character_boundary_and_says_how_much() {
+        let long = "é".repeat(OUTPUT_LIMIT);
+        let cut = cap_output(&long, 0);
+        assert!(cut.ends_with(&format!("… [{} more bytes]", OUTPUT_LIMIT)), "{}", &cut[cut.len() - 40..]);
+        assert_eq!(cut.len(), OUTPUT_LIMIT + "… [16384 more bytes]".len());
+        assert_eq!(cap_output("ok", 0), "ok");
+        assert_eq!(cap_output("ok", 5), "ok… [5 more bytes]");
     }
 
     #[test]

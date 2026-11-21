@@ -224,6 +224,41 @@ fn a_codex_error_glued_onto_an_earlier_message_fails_the_turn() {
 }
 
 #[test]
+fn claude_tool_calls_carry_their_command_paths_output_and_the_plan() {
+    let home = home(&[("claude", "claude-tool-calls.jsonl", CLAUDE)]);
+    let run = home.run(&["run", "claude", "--name", "t1", "--model", "haiku", "--effort", "low", "Run the tests, read calc.py and plan the fix"]);
+    assert!(run.status.success(), "{}", text(&run));
+    let events = home.events("t1");
+    let of = |kind: &str, id: &str| events.iter().find(|e| e["type"] == kind && e["id"] == id).unwrap_or_else(|| panic!("no {kind} {id}: {events:#?}")).clone();
+    // claude-agent-acp starts a Bash call with `rawInput: {}` and sends the command in an in-progress update.
+    let started = of("tool.started", "toolu_1");
+    assert_eq!((&started["title"], started.get("input")), (&"Terminal".into(), None), "{started}");
+    let updated = of("tool.updated", "toolu_1");
+    assert_eq!((&updated["input"]["command"], &updated["title"]), (&"cargo test".into(), &"cargo test".into()), "{updated}");
+    assert_eq!(of("tool.finished", "toolu_1")["output"], "```console\ntest add ... FAILED\n```");
+    let read = of("tool.started", "toolu_2");
+    assert_eq!((&read["locations"], &read["input"]["file_path"]), (&serde_json::json!(["/work/repo/calc.py"]), &"/work/repo/calc.py".into()), "{read}");
+    assert_eq!(of("tool.finished", "toolu_2")["output"], "def add(a, b):\n    return a - b\n");
+    let plan = events.iter().find(|e| e["type"] == "plan").unwrap();
+    assert_eq!(plan["entries"][0], serde_json::json!({"content": "Fix add()", "status": "in_progress", "priority": "medium"}), "{plan}");
+    assert_eq!(plan["entries"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn codex_tool_calls_carry_their_command_and_the_joined_terminal_output() {
+    let home = home(&[("codex", "codex-tool-calls.jsonl", CODEX)]);
+    let run = home.run(&["run", "codex", "--name", "t2", "--effort", "low", "Run the tests"]);
+    assert!(run.status.success(), "{}", text(&run));
+    let events = home.events("t2");
+    let started = events.iter().find(|e| e["type"] == "tool.started").unwrap();
+    assert_eq!((&started["title"], &started["input"]["command"]), (&"cargo test".into(), &"cargo test".into()), "{started}");
+    // An update with only terminal output adds no event; its output reaches `tool.finished`.
+    assert!(!events.iter().any(|e| e["type"] == "tool.updated"), "{events:#?}");
+    let finished = events.iter().find(|e| e["type"] == "tool.finished").unwrap();
+    assert_eq!((&finished["status"], &finished["output"]), (&"failed".into(), &"running 1 test\ntest add ... FAILED\n".into()), "{finished}");
+}
+
+#[test]
 fn copilot_without_an_effort_option_gets_a_notice() {
     let home = home(&[("copilot", "copilot-one-turn.jsonl", r#"options = { model = "model", mode = "mode" }"#)]);
     let run = home.run(&["run", "copilot", "--name", "g1", "--model", "auto", "--effort", "low", "Reply with exactly the word: pong"]);

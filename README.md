@@ -179,8 +179,10 @@ turn, `turn`; `raw` keeps the agent's own message it came from.
 | `turn.started` | `prompt` |
 | `message.delta`, `thought.delta` | `text` |
 | `message` | `text`: the whole reply of the turn, before it ends |
-| `tool.started` | `id`, `title`, `kind` |
-| `tool.finished` | `id`, `status` (completed, failed) |
+| `tool.started` | `id`, `title`, `kind`, `input` (the tool's arguments: `{"command": …}`, `{"file_path": …}`), `locations` (paths) |
+| `tool.updated` | `id` and what the agent added while the tool runs: `title`, `kind`, `input`, `locations` |
+| `tool.finished` | `id`, `status` (completed, failed), `title`, `output` (text, at most 16 KB, a longer one ends `… [N more bytes]`) |
+| `plan` | `entries` (`content`, `status`: pending, in_progress, completed; `priority`): the whole plan each time, none when cleared |
 | `permission.requested` | `request`, `title`, `options` (`id`, `name`, `kind`) |
 | `permission.answered` | `request`, `option`, `by` |
 | `usage` | `context_used`, `context_size`, `cost_usd`, `rate_limit` (`status`: allowed, allowed_warning, rejected; `window`, `resets_at`, `utilization`; claude only) |
@@ -191,6 +193,12 @@ turn, `turn`; `raw` keeps the agent's own message it came from.
 | `session.ended` | `reason` (closed, idle, or the error) |
 
 New types and fields can appear within version 1; readers skip what they don't know.
+
+A tool's fields come from what its adapter sends. Claude starts a call with no input and sends the command or path in
+`tool.updated` (several, each with all input known so far); Codex sends it with `tool.started` and its title is the
+command. `output` is the tool's text content, else its `rawOutput` (JSON other than a string as compact JSON), else
+the command's output joined from codex-acp's terminal chunks; `raw` keeps the full output. Amp gives `input` and
+`output`; the t3 backend reports no tool calls.
 
 A failed turn's `kind` comes from the adapter's error data where it sends some (claude-agent-acp: `data.errorKind`,
 `data.rateLimit.resetsAt`, ACP's `authRequired` code; codex-acp: `data.codexErrorInfo`, with the reason in `data.message`), else from the error text ("You've hit your usage limit",

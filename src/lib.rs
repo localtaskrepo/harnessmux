@@ -50,7 +50,7 @@ pub mod session;
 
 pub use agents::{AgentKind, AgentSpec, AgentTable};
 pub use error::{Error, Result};
-pub use event::{Event, EventBody, Failure, FailureKind, RateLimit, StopReason, Usage};
+pub use event::{Event, EventBody, Failure, FailureKind, OUTPUT_LIMIT, PlanEntry, RateLimit, StopReason, Usage};
 pub use profile::{Effort, McpServer, PermissionPolicy, Permissions, Profile};
 pub use registry::{Registry, SessionRecord, SessionState};
 pub use rules::Rules;

@@ -132,7 +132,13 @@ fn map_line(value: &Value) -> Vec<EventBody> {
             .iter()
             .filter_map(|block| match block.get("type").and_then(Value::as_str) {
                 Some("text") => Some(EventBody::MessageDelta { text: field(block, "text") }),
-                Some("tool_use") => Some(EventBody::ToolStarted { id: field(block, "id"), title: field(block, "name"), kind: None }),
+                Some("tool_use") => Some(EventBody::ToolStarted {
+                    id: field(block, "id"),
+                    title: field(block, "name"),
+                    kind: None,
+                    input: block.get("input").filter(|input| input.as_object().is_none_or(|map| !map.is_empty())).cloned(),
+                    locations: Vec::new(),
+                }),
                 _ => None,
             })
             .collect(),
@@ -141,7 +147,12 @@ fn map_line(value: &Value) -> Vec<EventBody> {
             .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
             .map(|block| {
                 let failed = block.get("is_error").and_then(Value::as_bool).unwrap_or(false);
-                EventBody::ToolFinished { id: field(block, "tool_use_id"), status: if failed { "failed" } else { "completed" }.into(), title: None }
+                EventBody::ToolFinished {
+                    id: field(block, "tool_use_id"),
+                    status: if failed { "failed" } else { "completed" }.into(),
+                    title: None,
+                    output: tool_result_text(block).map(|text| crate::acp_map::cap_output(&text, 0)),
+                }
             })
             .collect(),
         Some("result") => {
@@ -173,6 +184,21 @@ fn map_line(value: &Value) -> Vec<EventBody> {
     }
 }
 
+/// A `tool_result` block's `content`: a string, or the text of its text blocks.
+fn tool_result_text(block: &Value) -> Option<String> {
+    let text = match block.get("content")? {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return None,
+    };
+    (!text.trim().is_empty()).then_some(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,7 +209,19 @@ mod tests {
     #[test]
     fn the_documented_stream_becomes_events() {
         let events: Vec<EventBody> = DOCS_STREAM.lines().flat_map(|line| map_line(&serde_json::from_str(line).unwrap())).collect();
-        assert!(events.contains(&EventBody::ToolStarted { id: "toolu_example_1".into(), title: "Read".into(), kind: None }));
+        assert!(events.contains(&EventBody::ToolStarted {
+            id: "toolu_example_1".into(),
+            title: "Read".into(),
+            kind: None,
+            input: Some(serde_json::json!({"path": "/work/repo/calc.py"})),
+            locations: Vec::new(),
+        }));
+        assert!(events.contains(&EventBody::ToolFinished {
+            id: "toolu_example_1".into(),
+            status: "completed".into(),
+            title: None,
+            output: Some("def add(a, b):\n    return a - b\n".into()),
+        }));
         assert!(events.contains(&EventBody::MessageDelta { text: "Fixed add() to return a + b.".into() }));
         let last = events.last().unwrap();
         assert!(matches!(last, EventBody::TurnFinished { stop_reason: StopReason::EndTurn, usage } if usage.input_tokens == Some(2700)), "{last:?}");

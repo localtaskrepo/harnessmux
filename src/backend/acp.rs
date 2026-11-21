@@ -1,6 +1,6 @@
 //! The ACP driver: starts the agent's ACP server, creates or resumes the session, applies the profile and runs turns.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -21,7 +21,7 @@ use super::{Command, Report, Reporter, Start};
 use crate::acp_map::{self, ConfigOption};
 use crate::agents::AgentSpec;
 use crate::error::{Error, Result};
-use crate::event::{EventBody, Failure, PermissionOption, StopReason};
+use crate::event::{EventBody, Failure, OUTPUT_LIMIT, PermissionOption, StopReason};
 use crate::profile::{McpServer, PermissionPolicy, Profile};
 use crate::replay::Recorder;
 
@@ -147,6 +147,9 @@ struct Turn {
     /// The latest message chunk: codex-acp sends an error as a chunk of its own.
     last_chunk: String,
     ran_tools: bool,
+    /// Each running tool's terminal output so far (codex-acp sends it in chunks, not as the result), at most
+    /// [`OUTPUT_LIMIT`] bytes, and how many bytes more it had.
+    terminal: HashMap<String, (String, usize)>,
     future: PromptFuture,
 }
 
@@ -244,14 +247,32 @@ impl Driver {
     fn on_notification(&self, notification: &Value, mut turn: Option<&mut Turn>, options: &mut Vec<ConfigOption>) {
         let turn_id = turn.as_ref().map(|t| t.id);
         let update = notification.get("update").cloned().unwrap_or(Value::Null);
-        for body in acp_map::map_update(&update) {
+        if let (Some(current), Some(chunk)) = (turn.as_deref_mut(), acp_map::terminal_output(&update)) {
+            let id = update.get("toolCallId").and_then(Value::as_str).unwrap_or_default().to_string();
+            let (text, dropped) = current.terminal.entry(id).or_default();
+            let mut room = OUTPUT_LIMIT.saturating_sub(text.len()).min(chunk.len());
+            while !chunk.is_char_boundary(room) {
+                room -= 1;
+            }
+            text.push_str(&chunk[..room]);
+            *dropped += chunk.len() - room;
+        }
+        for mut body in acp_map::map_update(&update) {
             if let Some(current) = turn.as_deref_mut() {
-                match &body {
+                match &mut body {
                     EventBody::MessageDelta { text } => {
                         current.reply.push_str(text);
                         current.last_chunk.clone_from(text);
                     }
                     EventBody::ToolStarted { .. } => current.ran_tools = true,
+                    EventBody::ToolFinished { id, output, .. } => {
+                        if let Some((text, dropped)) = current.terminal.remove(id.as_str())
+                            && output.is_none()
+                            && !text.trim().is_empty()
+                        {
+                            *output = Some(acp_map::cap_output(&text, dropped));
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -402,7 +423,7 @@ impl Driver {
         let cx = cx.clone();
         let request = PromptRequest::new(session.clone(), vec![ContentBlock::Text(TextContent::new(text))]);
         let future: PromptFuture = Box::pin(async move { cx.send_request(request).block_task().await });
-        Turn { id, reply: String::new(), last_chunk: String::new(), ran_tools: false, future }
+        Turn { id, reply: String::new(), last_chunk: String::new(), ran_tools: false, terminal: HashMap::new(), future }
     }
 
     fn end_turn(&self, turn: Turn, done: std::result::Result<PromptResponse, agent_client_protocol::Error>) {

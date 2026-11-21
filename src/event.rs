@@ -84,6 +84,20 @@ pub struct PermissionOption {
     pub kind: String,
 }
 
+/// The most bytes of a tool's output an event carries.
+pub const OUTPUT_LIMIT: usize = 16 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanEntry {
+    pub content: String,
+    /// pending, in_progress or completed.
+    #[serde(default)]
+    pub status: String,
+    /// high, medium or low.
+    #[serde(default)]
+    pub priority: String,
+}
+
 /// How a turn ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -142,6 +156,27 @@ pub enum EventBody {
         title: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kind: Option<String>,
+        /// The tool's arguments as the agent sends them (ACP `rawInput`): `{"command": …}`, `{"file_path": …}`. Some
+        /// agents (Claude) send them only in a later `tool.updated`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<Value>,
+        /// Paths the tool reads or changes.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        locations: Vec<String>,
+    },
+    /// A running tool's title, kind, input or paths, once the agent knows them; only the fields this update carries.
+    /// Each update holds all input known so far.
+    #[serde(rename = "tool.updated")]
+    ToolUpdated {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<Value>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        locations: Vec<String>,
     },
     #[serde(rename = "tool.finished")]
     ToolFinished {
@@ -150,7 +185,14 @@ pub enum EventBody {
         status: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
+        /// The tool's text output, at most [`OUTPUT_LIMIT`] bytes (a longer one ends `… [N more bytes]`); `raw`
+        /// holds all of it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
     },
+    /// The agent's plan (its to-do list), whole each time; no entries when it cleared the plan.
+    #[serde(rename = "plan")]
+    Plan { entries: Vec<PlanEntry> },
     #[serde(rename = "permission.requested")]
     PermissionRequested { request: String, title: String, options: Vec<PermissionOption> },
     #[serde(rename = "permission.answered")]

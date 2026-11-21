@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0 (2026-11-21)
+
+- Tool calls say what they did: `tool.started` gains `input` (the tool's arguments, ACP `rawInput`) and `locations`
+  (paths); the new `tool.updated` carries the title, kind, input or paths an adapter sends while the tool runs
+  (claude-agent-acp sends a Bash command or Read path only there, so before, Claude tool calls were just "Terminal");
+  `tool.finished` gains `output`, the tool's text output cut at 16 KB (`OUTPUT_LIMIT`), for Codex joined from
+  codex-acp's terminal output chunks, for Amp from its `tool_result`. A `plan` update is a `plan` event with
+  `entries` (`content`, `status`, `priority`). The event format stays version 1. A library match on
+  `EventBody::ToolStarted` or `EventBody::ToolFinished` without `..` needs it now, hence the minor version (HARN-14).
+
 ## 0.2.1 (2026-11-21)
 
 - A t3 session with a provider and model starts its thread at the profile's effort and `options`, as T3 Code's model
