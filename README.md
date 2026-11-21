@@ -129,7 +129,7 @@ command = ["my-agent", "--acp"]
 | claude | `claude-agent-acp` 0.107.0 | run live: new, send, resume after the owner was killed, cancel |
 | codex | `codex-acp` 2.6.0 | run live: new, send, effort |
 | copilot | `copilot --acp --stdio` (1.0.111) | run live: one turn, a model error reported as `turn.failed` |
-| t3 | `t3 thread start/show` and T3 Code's MCP server (T3 Code 0.1.10) | run live: new thread, a thread in an existing worktree, a later turn, a repeated launch and send, settle |
+| t3 | `t3 thread start/show` and T3 Code's MCP server (T3 Code 0.1.10; the activity 0.1.11) | run live: new thread, a thread in an existing worktree, a later turn, a repeated launch and send, settle, tool calls from the activity |
 | gemini | `gemini --acp` | from its docs, not run live |
 | cursor | `cursor-agent acp` | from its docs, not run live |
 | droid | `droid exec --output-format acp` | from its docs, not run live |
@@ -167,6 +167,15 @@ never shown or logged) and trades it for an OAuth token, kept for 30 days in `<s
 the user only). T3 Code lists it as session `harnessmux`; `t3 auth session revoke <id>` ends it, and the next turn
 signs in again. The server's address comes from T3 Code's `userdata/server-runtime.json` (`T3CODE_HOME`, default
 `~/.t3`).
+
+While a t3 turn runs, harnessmux reads the thread's activity (`t3_thread_read`, view `activity`) every 2 seconds and
+sends the turn's run in T3's order: each command, file change and other tool as `tool.started` (id: T3's `itemId`;
+title: the command, the file's path, else the tool's title or name; kind `execute` for a command, `edit` for a file
+change; a file change's path in `locations`, another tool's `input`) and `tool.finished` once it ends (`completed`,
+else `failed`; `output`: a command's output, another tool's), each thought as `thought.delta` and each reply as `message.delta`, whole, once it has ended; `raw` is T3's item. The
+prompt, T3's own notes, checkpoints and errors send nothing, nor do the items of other threads. When the activity
+can't be read, a notice says so and the rest of the turn streams the replies from `t3 thread show`. T3 Code shows no
+token usage, so a t3 turn sends no `usage`.
 
 ## Events
 

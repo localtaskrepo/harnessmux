@@ -2,7 +2,9 @@
 //! directory is a git worktree of its project, it is T3's MCP tool `t3_thread_launch` with that worktree
 //! (`existing_worktree`, full access), as T3's CLI can only make a new worktree. Later turns are `t3_thread_send`. Both
 //! carry a `clientRequestId` from the session (and the turn), so a retry never makes a second thread or run; the MCP
-//! sign-in is in [`super::t3_mcp`]. `t3 thread show --json` is polled to follow the run; a run that ends neither
+//! sign-in is in [`super::t3_mcp`]. `t3 thread show --json` is polled to follow the run, and T3's thread activity
+//! (`t3_thread_read`, view `activity`) gives the run's replies, thoughts and tool calls in order ([`Activity`]); a
+//! turn whose activity can't be read streams the replies from `t3 thread show`. A run that ends neither
 //! completed nor waiting fails the turn with the run's `error` items from the thread's activity (`t3_thread_read`), as
 //! `t3 thread show` has no error.
 //! The thread lives in T3 Code, so a session resumes by sending to it again; when the previous owner stopped during a
@@ -15,6 +17,7 @@
 //! takes only with a provider and model. T3's CLI has no child threads, no permission answers and no interrupt.
 //! [`settle`] moves a finished thread to T3's Settled group.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -97,6 +100,7 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
             }
         };
         reporter.event(Some(turn), EventBody::TurnStarted { prompt: text.clone() }, None);
+        follow.activity = Activity::default();
         if let Some((since, _)) = unresolved.take() {
             match find_thread(&program, &start, &since, &reporter).await {
                 Ok(Some(id)) => {
@@ -215,8 +219,8 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
                             let shown = show(&program, &start, &id).await.thread();
                             follow.link = shown.as_ref().and_then(link);
                             reporter.event(None, started(&start, &id, "new", follow.link.clone()), None);
-                            for message in shown.map(|shown| follow.take_new(&shown)).unwrap_or_default() {
-                                reporter.event(Some(turn), EventBody::MessageDelta { text: message }, None);
+                            if let Some(shown) = shown {
+                                stream(&mut mcp, &cli, &id, &shown, true, &mut follow, turn, &reporter).await;
                             }
                         } else if !is_noise(&line) && !line.trim().is_empty() {
                             error_text.push_str(&line);
@@ -226,10 +230,8 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
                     _ => break child.wait().await.map_err(|error| Error::io("waiting for t3", error))?,
                 },
                 _ = poll.tick() => {
-                    if let Some(shown) = match &thread { Some(id) => show(&program, &start, id).await.thread(), None => None } {
-                        for message in follow.take_new(&shown) {
-                            reporter.event(Some(turn), EventBody::MessageDelta { text: message }, None);
-                        }
+                    if let Some(id) = &thread && let Shown::Thread(shown) = show(&program, &start, id).await {
+                        stream(&mut mcp, &cli, id, &shown, true, &mut follow, turn, &reporter).await;
                     }
                 }
                 command = commands.recv() => match command {
@@ -250,6 +252,13 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
         };
         let reply = reply.await.unwrap_or_default().trim().to_string();
         let link = follow.link.clone().or_else(|| thread.clone()).unwrap_or_default();
+        // What the run did since the last poll.
+        if !cancelled
+            && let Some(id) = &thread
+            && let Shown::Thread(shown) = show(&program, &start, id).await
+        {
+            stream(&mut mcp, &cli, id, &shown, true, &mut follow, turn, &reporter).await;
+        }
         if cancelled {
             reporter.event(Some(turn), EventBody::TurnFinished { stop_reason: StopReason::Cancelled, usage: Usage::default() }, None);
             continue;
@@ -303,11 +312,9 @@ async fn follow_run(
                 Shown::Thread(shown) => {
                     failed_reads = 0;
                     unreachable_since = None;
-                    for message in follow.take_new(&shown) {
-                        reporter.event(Some(turn), EventBody::MessageDelta { text: message }, None);
-                    }
                     let state = RunState::of(&shown);
                     current = current || state.run.as_deref() == run;
+                    stream(mcp, cli, thread, &shown, current, follow, turn, reporter).await;
                     if current && (!state.running || state.waiting) {
                         break shown;
                     }
@@ -372,8 +379,6 @@ async fn follow_run(
 /// as one text; `t3 thread show` has none. The newest items: without `beforePosition`, T3 gives a client outside a
 /// thread the oldest ones, which miss the error of a run that did some work first.
 async fn run_errors(mcp: &mut Option<Mcp>, cli: &Cli, thread: &str, run: Option<&str>) -> Result<String> {
-    // JavaScript's largest safe integer: after every item, as T3 Code needs a safe integer here.
-    const NEWEST: u64 = (1 << 53) - 1;
     let arguments = json!({"threadId": thread, "view": "activity", "limit": 20, "maxCharsPerItem": 2000, "beforePosition": NEWEST});
     let read = call(mcp, cli, "t3_thread_read", arguments).await?;
     Ok(errors_of(&read, run))
@@ -579,12 +584,13 @@ impl RunState {
     }
 }
 
-/// New assistant messages of the thread's current run, from `t3 thread show --json`.
+/// New assistant messages of the thread's current run, from `t3 thread show --json`, and the turn's [`Activity`].
 #[derive(Default)]
 struct Follow {
     run: Option<String>,
     seen: usize,
     link: Option<String>,
+    activity: Activity,
 }
 
 impl Follow {
@@ -611,6 +617,263 @@ impl Follow {
         let new = replies.iter().skip(self.seen).map(|text| format!("{text}\n\n")).collect();
         self.seen = self.seen.max(replies.len());
         new
+    }
+}
+
+/// JavaScript's largest safe integer: a read before it gets the newest items, as T3 Code needs a safe integer there.
+const NEWEST: u64 = (1 << 53) - 1;
+/// Items per activity read (T3 Code's most).
+const PAGE: u64 = 100;
+/// Pages one poll reads at most; the rest come on the next poll.
+const PAGES: usize = 10;
+/// Characters of an item's text per read; a reply or thought cut off here is read on by its id.
+const ITEM_CHARS: u64 = 4000;
+/// Reads one reply or thought takes at most.
+const TEXT_READS: usize = 20;
+
+/// The turn's run as T3 Code's thread activity (`t3_thread_read`, view `activity`) shows it: its replies, thoughts and
+/// tool calls in T3's order, each sent once. When the activity can't be read, the rest of the turn streams replies from
+/// `t3 thread show` ([`Follow`]).
+#[derive(Default)]
+struct Activity {
+    run: Option<String>,
+    /// The next read starts after this position; none: the newest items.
+    after: Option<i64>,
+    /// The run's items sent so far, and whether each has ended.
+    sent: HashMap<String, bool>,
+    /// The activity couldn't be read in this turn.
+    off: bool,
+}
+
+impl Activity {
+    /// The run's new events since the last read, with T3's item as `raw`.
+    async fn read(&mut self, mcp: &mut Option<Mcp>, cli: &Cli, thread: &str, run: &str) -> Result<Vec<(EventBody, Value)>> {
+        if self.run.as_deref() != Some(run) {
+            *self = Self { run: Some(run.to_string()), ..Self::default() };
+        }
+        let mut items = Vec::new();
+        // Pages forward from the read position; the first read pages back from the newest item to the run's start.
+        let (mut after, mut before) = (self.after, NEWEST);
+        for _ in 0..PAGES {
+            let mut arguments = json!({"threadId": thread, "view": "activity", "limit": PAGE, "maxCharsPerItem": ITEM_CHARS});
+            match after {
+                Some(position) => arguments["afterPosition"] = json!(position),
+                None => arguments["beforePosition"] = json!(before),
+            }
+            let read = call(mcp, cli, "t3_thread_read", arguments).await?;
+            let page = read.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
+            let (first, last) = (page.iter().filter_map(position).min(), page.iter().filter_map(position).max());
+            let older_run = page.iter().any(|item| {
+                item.get("runId").and_then(Value::as_str) != Some(run)
+                    && item.get("sourceThreadId").and_then(Value::as_str).is_none_or(|source| source == thread)
+            });
+            let full = page.len() as u64 >= PAGE;
+            items.extend(page);
+            match (after, first, last) {
+                (Some(_), _, Some(last)) if read.get("hasMore").and_then(Value::as_bool) == Some(true) => after = i64::try_from(last).ok(),
+                (None, Some(first), _) if full && !older_run && first > 0 => before = first,
+                _ => break,
+            }
+        }
+        let mut events = Vec::new();
+        // An item's text cut off by the read is read on by its id, once per poll.
+        let mut whole: HashMap<String, String> = HashMap::new();
+        for (body, item) in self.take(items, thread, run) {
+            let body = match item.get("itemId").and_then(Value::as_str) {
+                Some(id) if item.get("textTruncated").and_then(Value::as_bool) == Some(true) => {
+                    if !whole.contains_key(id) {
+                        whole.insert(id.to_string(), full_text(mcp, cli, thread, &item).await?);
+                    }
+                    fill(body, &item, &whole[id])
+                }
+                _ => body,
+            };
+            events.push((body, item));
+        }
+        Ok(events)
+    }
+
+    /// The events of `items` (one read) not sent yet, each with its item; moves the next read's start.
+    fn take(&mut self, mut items: Vec<Value>, thread: &str, run: &str) -> Vec<(EventBody, Value)> {
+        items.sort_by_key(|item| position(item).unwrap_or(u64::MAX));
+        let mut events = Vec::new();
+        let mut oldest_open = None;
+        for item in &items {
+            if item.get("runId").and_then(Value::as_str) != Some(run)
+                || item.get("sourceThreadId").and_then(Value::as_str).is_some_and(|source| source != thread)
+            {
+                continue;
+            }
+            let Some(id) = item.get("itemId").and_then(Value::as_str) else { continue };
+            let item_text = item.get("text").and_then(Value::as_str).unwrap_or_default();
+            let ended = ended(item);
+            if !ended {
+                oldest_open = oldest_open.or(position(item));
+            }
+            let sent = self.sent.get(id).copied();
+            if sent == Some(true) || (sent == Some(false) && !ended) {
+                continue;
+            }
+            match kind_of(item) {
+                Kind::Skipped => {}
+                Kind::Text(text) => {
+                    if ended {
+                        if !item_text.trim().is_empty() {
+                            events.push((fill(text(String::new()), item, item_text), item.clone()));
+                        }
+                        self.sent.insert(id.to_string(), true);
+                    }
+                }
+                Kind::Tool { title, kind } => {
+                    if sent.is_none() {
+                        let started = EventBody::ToolStarted { id: id.to_string(), title: title.clone(), kind, input: None, locations: Vec::new() };
+                        events.push((fill(started, item, item_text), item.clone()));
+                    }
+                    if ended {
+                        let status = if item.get("status").and_then(Value::as_str) == Some("completed") { "completed" } else { "failed" };
+                        let finished = EventBody::ToolFinished { id: id.to_string(), status: status.into(), title: Some(title), output: None };
+                        events.push((fill(finished, item, item_text), item.clone()));
+                    }
+                    self.sent.insert(id.to_string(), ended);
+                }
+            }
+        }
+        // An item still running may change, so the next read starts at it.
+        self.after = match oldest_open {
+            Some(open) => i64::try_from(open).ok().map(|open| open - 1),
+            None => items.iter().filter_map(position).max().and_then(|last| i64::try_from(last).ok()).or(self.after),
+        };
+        events
+    }
+}
+
+fn position(item: &Value) -> Option<u64> {
+    item.get("position").and_then(Value::as_u64)
+}
+
+/// Whether the item is done: T3 Code marks one that still runs `running`.
+fn ended(item: &Value) -> bool {
+    !matches!(item.get("status").and_then(Value::as_str), Some("running" | "pending" | "in_progress" | "starting"))
+}
+
+enum Kind {
+    /// The prompt, T3's own notes and checkpoints, and errors (which end a failed turn, [`errors_of`]).
+    Skipped,
+    /// A reply or a thought: the event for its text.
+    Text(fn(String) -> EventBody),
+    Tool {
+        title: String,
+        kind: Option<String>,
+    },
+}
+
+fn kind_of(item: &Value) -> Kind {
+    let field = |key: &str| item.get(key).and_then(Value::as_str).map(str::trim).filter(|text| !text.is_empty());
+    let first_line = || field("text").and_then(|text| text.lines().next()).map(|line| line.trim_start_matches("$ ").trim().to_string());
+    let item_type = field("type").unwrap_or("tool");
+    match item_type {
+        "user_message" | "checkpoint" | "notification" | "error" => Kind::Skipped,
+        "assistant_message" => Kind::Text(|text| EventBody::MessageDelta { text }),
+        "reasoning" => Kind::Text(|text| EventBody::ThoughtDelta { text }),
+        "command_execution" => Kind::Tool { title: first_line().unwrap_or_else(|| item_type.into()), kind: Some("execute".into()) },
+        "file_change" => {
+            Kind::Tool { title: first_line().or_else(|| field("title").map(str::to_string)).unwrap_or_else(|| item_type.into()), kind: Some("edit".into()) }
+        }
+        _ => {
+            // A tool's text is its call as JSON, maybe cut off; only its name is needed.
+            let name = || {
+                let text = field("text")?;
+                let rest = &text[text.find("\"toolName\"")? + "\"toolName\"".len()..];
+                let rest = rest.trim_start().strip_prefix(':')?.trim_start().strip_prefix('"')?;
+                Some(rest[..rest.find('"')?].to_string())
+            };
+            Kind::Tool { title: field("title").map(str::to_string).or_else(name).unwrap_or_else(|| item_type.into()), kind: None }
+        }
+    }
+}
+
+/// `body` with what `text`, the item's text, says (T3 Code's `turnItemText`): a reply's or thought's text; a tool's
+/// input and paths when it starts, its output when it ends. A command's text is `$ <command>` and its output; a file
+/// change's is its path, `+N -M` and the diff; another tool's is JSON with `toolName`, `input` and `output`.
+fn fill(body: EventBody, item: &Value, text: &str) -> EventBody {
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+    let call = || (item_type == "dynamic_tool").then(|| serde_json::from_str::<Value>(text).ok()).flatten();
+    match body {
+        EventBody::MessageDelta { .. } => EventBody::MessageDelta { text: format!("{text}\n\n") },
+        EventBody::ThoughtDelta { .. } => EventBody::ThoughtDelta { text: format!("{text}\n\n") },
+        EventBody::ToolStarted { id, title, kind, .. } => {
+            let input = call().and_then(|call| call.get("input").cloned()).filter(|input| !input.is_null());
+            let path = (item_type == "file_change").then(|| text.lines().next().map(str::trim).filter(|path| !path.is_empty())).flatten();
+            EventBody::ToolStarted { id, title, kind, input, locations: path.map(str::to_string).into_iter().collect() }
+        }
+        EventBody::ToolFinished { id, status, title, .. } => {
+            let output = match item_type {
+                "command_execution" => text.split_once('\n').map(|(_, output)| output.to_string()),
+                "dynamic_tool" => call().and_then(|call| match call.get("output")? {
+                    Value::Null => None,
+                    Value::String(output) => Some(output.clone()),
+                    output => Some(output.to_string()),
+                }),
+                _ => None,
+            };
+            EventBody::ToolFinished {
+                id,
+                status,
+                title,
+                output: output.filter(|output| !output.is_empty()).map(|output| crate::acp_map::cap_output(&output, 0)),
+            }
+        }
+        body => body,
+    }
+}
+
+/// The item's whole text, read on by its id where the activity read cut it off.
+async fn full_text(mcp: &mut Option<Mcp>, cli: &Cli, thread: &str, item: &Value) -> Result<String> {
+    let mut text = item.get("text").and_then(Value::as_str).unwrap_or_default().to_string();
+    let mut next = item.get("nextTextOffset").and_then(Value::as_u64).filter(|_| item.get("textTruncated").and_then(Value::as_bool) == Some(true));
+    let id = item.get("itemId").and_then(Value::as_str).unwrap_or_default();
+    for _ in 0..TEXT_READS {
+        let Some(offset) = next else { break };
+        let arguments = json!({"threadId": thread, "view": "activity", "itemId": id, "textOffset": offset, "maxCharsPerItem": 20_000});
+        let read = call(mcp, cli, "t3_thread_read", arguments).await?;
+        let Some(part) = read.get("items").and_then(Value::as_array).and_then(|items| items.first()) else { break };
+        text.push_str(part.get("text").and_then(Value::as_str).unwrap_or_default());
+        next = part.get("nextTextOffset").and_then(Value::as_u64).filter(|_| part.get("textTruncated").and_then(Value::as_bool) == Some(true));
+    }
+    Ok(text)
+}
+
+/// Sends what the thread did since the last poll: from its activity, else its replies from `t3 thread show`. The
+/// activity is read only once `current`, the turn's run, shows.
+#[expect(clippy::too_many_arguments, reason = "the run loop's state, passed down")]
+async fn stream(mcp: &mut Option<Mcp>, cli: &Cli, thread: &str, shown: &Value, current: bool, follow: &mut Follow, turn: u64, reporter: &Reporter) {
+    // Read on every poll, so a fallback starts after the replies the activity sent.
+    let replies = follow.take_new(shown);
+    let activity = &mut follow.activity;
+    if !activity.off
+        && current
+        && let Some(run) = follow.run.clone()
+    {
+        match activity.read(mcp, cli, thread, &run).await {
+            Ok(events) => {
+                for (body, raw) in events {
+                    reporter.event(Some(turn), body, Some(raw));
+                }
+                return;
+            }
+            Err(error) => {
+                activity.off = true;
+                reporter.notice(
+                    Some(turn),
+                    format!("could not read the T3 Code thread's activity, so this turn shows its replies but not its tool calls: {error}"),
+                );
+            }
+        }
+    }
+    if follow.activity.off || follow.activity.run.is_none() {
+        for text in replies {
+            reporter.event(Some(turn), EventBody::MessageDelta { text }, None);
+        }
     }
 }
 
@@ -806,6 +1069,104 @@ mod tests {
         );
         assert_eq!(follow.take_new(&second), ["Done\n\n"]);
         assert_eq!(follow.link.as_deref(), Some("https://t3/x"));
+    }
+
+    #[test]
+    fn a_runs_activity_becomes_its_tool_calls_thoughts_and_replies_once_in_order() {
+        let item = |position: u64, id: &str, kind: &str, status: &str, text: &str| json!({"position": position, "itemId": id, "runId": "r1", "type": kind, "status": status, "title": null, "text": text});
+        let mut activity = Activity::default();
+        let first = vec![
+            item(3, "c1", "command_execution", "running", "$ cargo test\nrunning 3 tests"),
+            item(1, "u1", "user_message", "completed", "Fix it"),
+            item(2, "th1", "reasoning", "completed", "Looking at the tests."),
+            json!({"position": 0, "itemId": "old", "runId": "r0", "type": "command_execution", "status": "completed", "text": "$ ls"}),
+            json!({"position": 4, "itemId": "kid", "runId": "r1", "sourceThreadId": "child", "type": "command_execution", "status": "running", "text": "$ ls"}),
+        ];
+        let bodies = |events: Vec<(EventBody, Value)>| events.into_iter().map(|(body, _)| body).collect::<Vec<_>>();
+        let started = |id: &str, title: &str, kind: Option<&str>, locations: &[&str]| EventBody::ToolStarted {
+            id: id.into(),
+            title: title.into(),
+            kind: kind.map(str::to_string),
+            input: None,
+            locations: locations.iter().map(|path| path.to_string()).collect(),
+        };
+        let finished = |id: &str, status: &str, title: &str, output: Option<&str>| EventBody::ToolFinished {
+            id: id.into(),
+            status: status.into(),
+            title: Some(title.into()),
+            output: output.map(str::to_string),
+        };
+        assert_eq!(
+            bodies(activity.take(first.clone(), "t1", "r1")),
+            [EventBody::ThoughtDelta { text: "Looking at the tests.\n\n".into() }, started("c1", "cargo test", Some("execute"), &[])]
+        );
+        // The running command holds the next read's start, so its end isn't missed.
+        assert_eq!(activity.after, Some(2));
+        assert!(activity.take(first, "t1", "r1").is_empty());
+        let second = vec![
+            item(3, "c1", "command_execution", "completed", "$ cargo test\nok"),
+            item(5, "e1", "file_change", "failed", "/work/repo/src/lib.rs\n@@ -1 +1 @@"),
+            json!({"position": 6, "itemId": "d1", "runId": "r1", "type": "dynamic_tool", "status": "completed", "title": null, "text": "{\n  \"toolName\": \"mcp__t3-code__t3_thread_read\",\n  \"input\": {\"thr"}),
+            item(7, "m1", "assistant_message", "running", "Done"),
+        ];
+        assert_eq!(
+            bodies(activity.take(second.clone(), "t1", "r1")),
+            [
+                finished("c1", "completed", "cargo test", Some("ok")),
+                started("e1", "/work/repo/src/lib.rs", Some("edit"), &["/work/repo/src/lib.rs"]),
+                finished("e1", "failed", "/work/repo/src/lib.rs", None),
+                // A tool's JSON cut off by the read gives no input or output here; [`Activity::read`] reads it whole.
+                started("d1", "mcp__t3-code__t3_thread_read", None, &[]),
+                finished("d1", "completed", "mcp__t3-code__t3_thread_read", None),
+            ]
+        );
+        // A reply is sent once it has ended, whole.
+        assert_eq!(activity.after, Some(6));
+        let mut third = second;
+        third[3]["status"] = json!("completed");
+        assert_eq!(bodies(activity.take(third, "t1", "r1")), [EventBody::MessageDelta { text: "Done\n\n".into() }]);
+        assert_eq!(activity.after, Some(7));
+        assert!(activity.take(Vec::new(), "t1", "r1").is_empty());
+        assert_eq!(activity.after, Some(7));
+    }
+
+    #[test]
+    fn a_t3_tool_is_named_by_its_title_else_by_what_it_ran() {
+        let title = |item: Value| match kind_of(&item) {
+            Kind::Tool { title, .. } => title,
+            _ => panic!("not a tool: {item}"),
+        };
+        assert_eq!(title(json!({"type": "dynamic_tool", "title": "Read /work/repo/a.rs", "text": "{\"toolName\": \"Read\"}"})), "Read /work/repo/a.rs");
+        assert_eq!(title(json!({"type": "dynamic_tool", "title": null, "text": "{\"toolName\": \"Grep\", \"input\": {"})), "Grep");
+        assert_eq!(title(json!({"type": "web_search", "title": null, "text": ""})), "web_search");
+        // A file change is named by its path; some adapters (Pi) title it by the tool, `edit` or `write`.
+        assert_eq!(title(json!({"type": "file_change", "title": "edit", "text": "/work/repo/a.rs\n+1 -0\n@@ -1 +1,2 @@"})), "/work/repo/a.rs");
+        assert_eq!(title(json!({"type": "file_change", "title": "write", "text": null})), "write");
+        assert!(matches!(kind_of(&json!({"type": "error", "text": "limit"})), Kind::Skipped));
+    }
+
+    #[test]
+    fn a_t3_tools_input_paths_and_output_come_from_its_text() {
+        let started = EventBody::ToolStarted { id: "x".into(), title: "x".into(), kind: None, input: None, locations: Vec::new() };
+        let finished = EventBody::ToolFinished { id: "x".into(), status: "completed".into(), title: None, output: None };
+        let item = |kind: &str| json!({"type": kind});
+        let call = json!({"toolName": "Read", "input": {"file_path": "/work/repo/a.rs"}, "output": "fn main() {}"}).to_string();
+        let EventBody::ToolStarted { input, .. } = fill(started.clone(), &item("dynamic_tool"), &call) else { panic!() };
+        assert_eq!(input, Some(json!({"file_path": "/work/repo/a.rs"})));
+        let EventBody::ToolFinished { output, .. } = fill(finished.clone(), &item("dynamic_tool"), &call) else { panic!() };
+        assert_eq!(output.as_deref(), Some("fn main() {}"));
+        // Output that isn't text is its JSON.
+        let call = json!({"toolName": "Grep", "input": {}, "output": {"matches": 2}}).to_string();
+        let EventBody::ToolFinished { output, .. } = fill(finished.clone(), &item("dynamic_tool"), &call) else { panic!() };
+        assert_eq!(output.as_deref(), Some(r#"{"matches":2}"#));
+        let EventBody::ToolStarted { locations, input, .. } = fill(started, &item("file_change"), "/work/repo/a.rs\n+1 -0") else { panic!() };
+        assert_eq!((locations, input), (vec!["/work/repo/a.rs".to_string()], None));
+        // A command's output is what follows its `$ ` line, capped like any tool's.
+        let EventBody::ToolFinished { output, .. } = fill(finished.clone(), &item("command_execution"), "$ ls") else { panic!() };
+        assert_eq!(output, None);
+        let long = format!("$ yes\n{}", "y\n".repeat(crate::event::OUTPUT_LIMIT));
+        let EventBody::ToolFinished { output, .. } = fill(finished, &item("command_execution"), &long) else { panic!() };
+        assert!(output.unwrap().ends_with(&format!("… [{} more bytes]", crate::event::OUTPUT_LIMIT)));
     }
 
     #[test]

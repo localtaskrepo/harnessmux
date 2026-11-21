@@ -20,6 +20,11 @@
 - `harnessmux list` and `status` show a running or waiting session whose owner process is gone (killed before it
   saved its state) as `interrupted`; `--json` keeps the recorded `state` and adds `"owner_alive": false`. Before,
   such a session kept showing `running` (HARN-20).
+- A t3 turn reports what the T3 Code thread does, live: its commands, file changes and other tools as `tool.started`
+  and `tool.finished` (with a file change's path, a tool's input and a command's or tool's output), its thoughts as
+  `thought.delta` and its replies as `message.delta`, in T3's order and with T3's item as `raw`, from the thread's
+  activity (`t3_thread_read`, view `activity`). Before, it sent only the replies. When the activity can't be read, a
+  notice says so and the turn streams the replies from `t3 thread show` as before (HARN-15).
 
 ## 0.2.1 (2026-11-21)
 

@@ -521,8 +521,10 @@ fn base64url(bytes: &[u8]) -> String {
 /// A fake T3 Code server for `dir`'s fake `t3`, with one project at `project`: the MCP OAuth sign-in (the pairing code
 /// `pair-1`, PKCE checked) and `/mcp`. `t3_thread_launch` returns thread t1 (the same thread for a repeated
 /// `clientRequestId`), or fails with the text in `launch-error`; `t3_thread_send` and the launch name run r2;
-/// `t3_thread_read` pages the items in `activity.json` (none without it) as T3 Code does for a client outside a thread:
-/// the oldest `limit` without `beforePosition`, else the newest `limit` before it. Each
+/// `t3_thread_read` pages the items in `activity.json` (without it, the assistant replies in `show.json`; from the second
+/// page read on, also those in `activity-more.json`) as T3 Code does for a client outside a thread: the oldest `limit` without a position, the newest `limit` before
+/// `beforePosition`, the oldest `limit` after `afterPosition`, an item's text from `textOffset` with `itemId`; texts are
+/// cut at `maxCharsPerItem`. Each
 /// sign-in step and tool call is appended to `calls` (`oauth token`, `mcp <tool> <arguments>`). Once `revoke` exists,
 /// the next `/mcp` request finds every token revoked (and removes the file). Returns the origin.
 #[cfg(unix)]
@@ -539,6 +541,7 @@ fn fake_t3_server(dir: &Path, project: &Path) -> String {
             writeln!(file, "{line}").unwrap();
         };
         let (mut tokens, mut codes, mut threads) = (HashSet::new(), HashMap::new(), HashMap::new());
+        let mut page_reads = 0;
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
@@ -616,17 +619,78 @@ fn fake_t3_server(dir: &Path, project: &Path) -> String {
                             },
                             "t3_thread_send" => Ok(thread(arguments["threadId"].as_str().unwrap())),
                             "t3_thread_read" => {
-                                let items: Vec<serde_json::Value> =
-                                    std::fs::read_to_string(dir.join("activity.json")).map_or(Vec::new(), |a| serde_json::from_str(&a).unwrap());
-                                let limit = arguments["limit"].as_u64().map_or(20, |n| n as usize);
-                                let page = match arguments["beforePosition"].as_u64() {
-                                    None => &items[..limit.min(items.len())],
-                                    Some(before) => {
-                                        let end = (before as usize).min(items.len());
-                                        &items[end.saturating_sub(limit)..end]
-                                    }
+                                // The activity holds the replies `thread show` prints, unless `activity.json` says what it holds.
+                                let mut items: Vec<Value> = match std::fs::read_to_string(dir.join("activity.json")) {
+                                    Ok(activity) => serde_json::from_str(&activity).unwrap(),
+                                    Err(_) => std::fs::read_to_string(dir.join("show.json"))
+                                        .ok()
+                                        .and_then(|show| serde_json::from_str::<Value>(&show).ok())
+                                        .and_then(|show| show["messages"].as_array().cloned())
+                                        .unwrap_or_default()
+                                        .into_iter()
+                                        .filter(|m| m["role"] == "assistant")
+                                        .enumerate()
+                                        .map(|(n, m)| serde_json::json!({"itemId": format!("m{n}"), "runId": m["runId"], "type": "assistant_message", "status": "completed", "text": m["text"]}))
+                                        .collect(),
                                 };
-                                Ok(serde_json::json!({"items": page}))
+                                // The items in `activity-more.json` arrive after the first page read.
+                                if arguments.get("itemId").is_none() {
+                                    page_reads += 1;
+                                }
+                                if page_reads > 1
+                                    && let Ok(more) = std::fs::read_to_string(dir.join("activity-more.json"))
+                                {
+                                    items.extend(serde_json::from_str::<Vec<Value>>(&more).unwrap());
+                                }
+                                // Positions count from 0 where an item has none.
+                                let items: Vec<Value> = items
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(n, mut item)| {
+                                        if item.get("position").is_none() {
+                                            item["position"] = n.into();
+                                        }
+                                        item
+                                    })
+                                    .collect();
+                                let at = |item: &Value| item["position"].as_u64().unwrap();
+                                let limit = arguments["limit"].as_u64().map_or(20, |n| n as usize);
+                                let max = arguments["maxCharsPerItem"].as_u64().map_or(usize::MAX, |n| n as usize);
+                                if let Some(id) = arguments["itemId"].as_str() {
+                                    let item = items.iter().find(|item| item["itemId"] == id).unwrap();
+                                    let text: Vec<char> = item["text"].as_str().unwrap().chars().collect();
+                                    let from = arguments["textOffset"].as_u64().unwrap_or(0) as usize;
+                                    let to = (from + max).min(text.len());
+                                    let mut part = item.clone();
+                                    part["text"] = text[from..to].iter().collect::<String>().into();
+                                    part["textTruncated"] = (to < text.len()).into();
+                                    part["nextTextOffset"] = if to < text.len() { to.into() } else { Value::Null };
+                                    Ok(serde_json::json!({"items": [part]}))
+                                } else {
+                                    let page: Vec<&Value> = match (arguments["beforePosition"].as_u64(), arguments["afterPosition"].as_i64()) {
+                                        (Some(before), _) => {
+                                            let older: Vec<&Value> = items.iter().filter(|item| at(item) < before).collect();
+                                            older[older.len().saturating_sub(limit)..].to_vec()
+                                        }
+                                        (None, Some(after)) => items.iter().filter(|item| at(item) as i64 > after).take(limit).collect(),
+                                        (None, None) => items.iter().take(limit).collect(),
+                                    };
+                                    let has_more = page.last().is_some_and(|last| items.iter().any(|item| at(item) > at(last)));
+                                    let page: Vec<Value> = page
+                                        .into_iter()
+                                        .map(|item| {
+                                            let mut item = item.clone();
+                                            let text: Vec<char> = item["text"].as_str().unwrap_or_default().chars().collect();
+                                            if text.len() > max {
+                                                item["text"] = text[..max].iter().collect::<String>().into();
+                                                item["textTruncated"] = true.into();
+                                                item["nextTextOffset"] = max.into();
+                                            }
+                                            item
+                                        })
+                                        .collect();
+                                    Ok(serde_json::json!({"items": page, "hasMore": has_more}))
+                                }
                             }
                             _ => Ok(serde_json::json!({"sequence": 1})),
                         };
@@ -684,6 +748,91 @@ fn show(dir: &Path, status: &str, active: &str, pending: u64, messages: &str) {
         r#"{{"thread":{{"threadId":"t1","link":"https://t3/t1","status":"{status}","activeRunId":{active},"latestRunId":"r2","pendingRequestCount":{pending}}},"messages":{messages}}}"#
     );
     std::fs::write(dir.join("show.json"), json).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_t3_turn_reports_the_threads_tool_calls_thoughts_and_replies_from_its_activity() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    std::fs::write(dir.join("start-exit"), "0").unwrap();
+    let long = "word ".repeat(1000);
+    show(&dir, "completed", "null", 0, &serde_json::json!([{"role": "assistant", "runId": "r2", "text": long}]).to_string());
+    let item = |id: &str, kind: &str, status: &str, text: &str| serde_json::json!({"itemId": id, "runId": "r2", "type": kind, "status": status, "title": null, "text": text});
+    let items = [
+        item("u1", "user_message", "completed", "Fix it"),
+        item("th1", "reasoning", "completed", "Reading the tests."),
+        item("c1", "command_execution", "failed", "$ cargo test\nerror: 1 failed"),
+        item("m1", "assistant_message", "completed", &long),
+        item("x1", "command_execution", "completed", "$ ls")
+            .as_object()
+            .cloned()
+            .map(|mut other| {
+                other.insert("runId".into(), "r1".into());
+                Value::Object(other)
+            })
+            .unwrap(),
+    ];
+    std::fs::write(dir.join("activity.json"), Value::from(items.to_vec()).to_string()).unwrap();
+    let run = home.run(&["run", "t3", "--name", "a", "--provider", "claudeAgent", "--model", "m", "Fix it"]);
+    assert!(run.status.success(), "{}", text(&run));
+    let events = home.events("a");
+    let types: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).filter(|t| *t != "session.started").collect();
+    assert_eq!(types, ["turn.started", "thought.delta", "tool.started", "tool.finished", "message.delta", "message", "turn.finished"], "{events:?}");
+    let tool = events.iter().find(|e| e["type"] == "tool.started").unwrap();
+    assert_eq!((&tool["id"], &tool["title"], &tool["kind"]), (&"c1".into(), &"cargo test".into(), &"execute".into()), "{tool}");
+    assert_eq!(tool["raw"]["text"], "$ cargo test\nerror: 1 failed", "{tool}");
+    let done = events.iter().find(|e| e["type"] == "tool.finished").unwrap();
+    assert_eq!((&done["id"], &done["status"]), (&"c1".into(), &"failed".into()), "{done}");
+    assert_eq!(done["output"], "error: 1 failed", "{done}");
+    // The reply is longer than one read gives; it is read on by its id.
+    let reply = events.iter().find(|e| e["type"] == "message.delta").unwrap();
+    assert_eq!(reply["text"].as_str().unwrap(), format!("{long}\n\n"));
+    assert!(mcp_calls(&dir, "t3_thread_read").iter().any(|read| read["itemId"] == "m1" && read["textOffset"] == 4000));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_t3_turn_reads_its_activity_page_by_page_without_missing_or_repeating_an_item() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    std::fs::write(dir.join("start-exit"), "0").unwrap();
+    show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r2","text":"Done"}]"#);
+    let command = |n: usize, run: &str| serde_json::json!({"itemId": format!("c{n}"), "runId": run, "type": "command_execution", "status": "completed", "text": format!("$ step {n}")});
+    // An earlier run, then more than two pages of this run's items before the first read, and more than two after it.
+    let before: Vec<Value> = (0..5).map(|n| command(n, "r1")).chain((5..255).map(|n| command(n, "r2"))).collect();
+    let after: Vec<Value> = (255..505).map(|n| command(n, "r2")).collect();
+    std::fs::write(dir.join("activity.json"), Value::from(before).to_string()).unwrap();
+    std::fs::write(dir.join("activity-more.json"), Value::from(after).to_string()).unwrap();
+    let run = home.run(&["run", "t3", "--name", "p", "--provider", "claudeAgent", "--model", "m", "Fix it"]);
+    assert!(run.status.success(), "{}", text(&run));
+    let events = home.events("p");
+    let started: Vec<&str> = events.iter().filter(|e| e["type"] == "tool.started").map(|e| e["id"].as_str().unwrap()).collect();
+    let expected: Vec<String> = (5..505).map(|n| format!("c{n}")).collect();
+    assert_eq!(started, expected);
+    assert_eq!(events.iter().filter(|e| e["type"] == "tool.finished").count(), 500);
+    let reads = mcp_calls(&dir, "t3_thread_read");
+    assert!(reads.iter().filter(|read| read.get("beforePosition").is_some()).count() >= 3, "{reads:?}");
+    assert!(reads.iter().filter(|read| read.get("afterPosition").is_some()).count() >= 3, "{reads:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_t3_turn_whose_activity_cant_be_read_still_streams_its_replies() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    std::fs::write(dir.join("start-exit"), "0").unwrap();
+    std::fs::write(dir.join("pairing-fail"), "").unwrap();
+    show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r2","text":"Working"}]"#);
+    let run = home.run(&["run", "t3", "--name", "f", "--provider", "claudeAgent", "--model", "m", "Fix it"]);
+    assert!(run.status.success(), "{}", text(&run));
+    let events = home.events("f");
+    let notices: Vec<&Value> = events.iter().filter(|e| e["type"] == "notice").collect();
+    assert_eq!(notices.len(), 1, "{events:?}");
+    assert!(notices[0]["text"].as_str().unwrap().contains("shows its replies but not its tool calls"), "{events:?}");
+    let replies: Vec<&Value> = events.iter().filter(|e| e["type"] == "message.delta").collect();
+    assert_eq!(replies.len(), 1, "{events:?}");
+    assert_eq!(replies[0]["text"], "Working\n\n");
 }
 
 #[cfg(unix)]
