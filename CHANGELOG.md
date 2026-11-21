@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- A t3 session with a provider and model starts its thread at the profile's effort and `options`, as T3 Code's model
+  options (`t3 thread start --option effort=high`, `modelSelection.options` for a thread in a worktree); an `effort`
+  in `options` gives way to the profile's effort. Without a provider and model a notice says they are not applied;
+  before, effort was always dropped. `capabilities t3` says `"effort": "with --provider and --model"` (HARN-8).
+
 ## 0.2.0 (2026-11-20)
 
 - `turn.failed` says what the failure means: `kind` (rate_limited, quota, auth_required, overloaded,

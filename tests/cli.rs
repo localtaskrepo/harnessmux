@@ -359,7 +359,7 @@ fn capabilities_list_every_agent_without_starting_any() {
     let names: Vec<&str> = agents.iter().map(|a| a["agent"].as_str().unwrap()).collect();
     assert_eq!(names, ["amp", "antigravity", "claude", "codex", "copilot", "cursor", "droid", "gemini", "kilo", "opencode", "t3"]);
     let t3 = agents.iter().find(|a| a["agent"] == "t3").unwrap();
-    assert_eq!(t3["offers"]["effort"], false);
+    assert_eq!(t3["offers"]["effort"], "with --provider and --model");
     assert_eq!(t3["offers"]["child_threads"], false);
 }
 
@@ -415,7 +415,7 @@ fn start_errors_reach_the_caller_and_leave_no_session() {
 /// A fake `t3` CLI in `dir`: `thread start` names thread t1, prints `start-error` (if any) to stderr and exits with
 /// the code in `start-exit` after `start-sleep` seconds, `thread show` prints `show.json`, `thread list` prints
 /// `list.json` (or fails while `list-fail` exists), `auth pairing create` prints pairing code `pair-1` (fails while
-/// `pairing-fail` exists); every call is appended to `calls`. While `down` holds a number above 0, `thread show` counts
+/// `pairing-fail` exists); every call is appended to `calls`, and `thread start`'s arguments are written to `start-args`. While `down` holds a number above 0, `thread show` counts
 /// it down and fails as T3's CLI does when its server is down. A [`fake_t3_server`] answers T3 Code's MCP endpoint.
 #[cfg(unix)]
 fn fake_t3(home: &Home) -> PathBuf {
@@ -429,7 +429,7 @@ fn fake_t3(home: &Home) -> PathBuf {
 dir=$(dirname "$0")
 echo "$1 $2" >> "$dir/calls"
 case "$1 $2" in
-  "thread start") cat > /dev/null; echo "Thread t1" >&2; cat "$dir/start-error" >&2 2>/dev/null; sleep "$(cat "$dir/start-sleep" 2>/dev/null || echo 0)"; echo "Started."; exit "$(cat "$dir/start-exit")" ;;
+  "thread start") echo "$*" > "$dir/start-args"; cat > /dev/null; echo "Thread t1" >&2; cat "$dir/start-error" >&2 2>/dev/null; sleep "$(cat "$dir/start-sleep" 2>/dev/null || echo 0)"; echo "Started."; exit "$(cat "$dir/start-exit")" ;;
   "auth pairing")
     if [ -f "$dir/pairing-fail" ]; then echo "Could not reach the T3 Code server at http://127.0.0.1:3773" >&2; exit 1; fi
     echo '{"credential":"pair-1","expiresAt":"2026-01-01T00:02:00.000Z","id":"p","label":"harnessmux","scopes":[]}' ;;
@@ -661,6 +661,27 @@ fn a_t3_thread_waiting_for_an_answer_ends_the_turn_with_its_link() {
     let end = events.iter().find(|e| e["type"] == "turn.finished").unwrap();
     assert_eq!(end["stop_reason"], "waiting_for_answer", "{end}");
     assert!(events.iter().any(|e| e["type"] == "notice" && e["text"].as_str().unwrap().contains("waits for an answer; answer it in T3 Code: https://t3/t1")));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_t3_thread_starts_at_the_profiles_effort_as_a_model_option() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    std::fs::write(dir.join("start-exit"), "0").unwrap();
+    show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r1","text":"Done."}]"#);
+    let run = home.run(&["run", "t3", "--name", "e", "--provider", "codex", "--model", "m", "--effort", "high", "Fix it"]);
+    assert!(run.status.success(), "{}", text(&run));
+    let args = std::fs::read_to_string(dir.join("start-args")).unwrap();
+    assert!(args.contains("--provider codex --model m --option effort=high"), "{args}");
+    let events = home.events("e");
+    assert!(!events.iter().any(|e| e["type"] == "notice" && e["text"].as_str().unwrap().contains("effort")), "{events:?}");
+
+    let run = home.run(&["run", "t3", "--name", "n", "--effort", "high", "Fix it"]);
+    assert!(run.status.success(), "{}", text(&run));
+    assert!(!std::fs::read_to_string(dir.join("start-args")).unwrap().contains("--option"));
+    let events = home.events("n");
+    assert!(events.iter().any(|e| e["type"] == "notice" && e["text"].as_str().unwrap().contains("only with a provider and model")), "{events:?}");
 }
 
 #[cfg(unix)]
@@ -925,7 +946,8 @@ fn a_t3_session_in_a_worktree_launches_its_thread_there_and_sends_later_turns_th
     let worktree = git_worktree(&home);
     show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r2","text":"Done."}]"#);
     let wt = worktree.to_str().unwrap();
-    let run = home.run(&["run", "t3", "--name", "w", "--cwd", wt, "--provider", "claudeAgent", "--model", "m", "--title", "DEV-1 Fix", "Fix it"]);
+    let run =
+        home.run(&["run", "t3", "--name", "w", "--cwd", wt, "--provider", "claudeAgent", "--model", "m", "--effort", "high", "--title", "DEV-1 Fix", "Fix it"]);
     assert!(run.status.success(), "{}", text(&run));
     assert!(String::from_utf8_lossy(&run.stdout).contains("Done."), "{}", text(&run));
 
@@ -938,7 +960,8 @@ fn a_t3_session_in_a_worktree_launches_its_thread_there_and_sends_later_turns_th
     assert_eq!(Path::new(launch["workspaceStrategy"]["worktreePath"].as_str().unwrap()).canonicalize().unwrap(), worktree);
     assert_eq!(launch["runtimeMode"], "full-access", "{launch}");
     assert_eq!(launch["title"], "DEV-1 Fix", "{launch}");
-    assert_eq!(launch["modelSelection"], serde_json::json!({"instanceId": "claudeAgent", "model": "m"}), "{launch}");
+    let model = serde_json::json!({"instanceId": "claudeAgent", "model": "m", "options": [{"id": "effort", "value": "high"}]});
+    assert_eq!(launch["modelSelection"], model, "{launch}");
     assert_eq!(launch["message"], "Fix it", "{launch}");
     let launch_id = launch["clientRequestId"].as_str().unwrap();
     assert!(launch_id.starts_with("harnessmux:w:") && launch_id.ends_with(":launch"), "{launch_id}");

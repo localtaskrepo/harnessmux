@@ -144,8 +144,9 @@ failed with `model_not_found` for a ChatGPT account where 2.6.0 works) and bumps
 Some adapters send a failed model call as an ordinary reply that ends the turn. A short reply that is only an error
 text (`model_not_found`, an auth failure, `Error: Execution failed: …`) ends the turn as `turn.failed`.
 
-T3 Code's CLI has no effort setting, no child threads, no interrupt and no permission answers: `capabilities t3`
-says so, and `cancel` stops waiting while the thread keeps running in T3 Code. A thread that waits for an answer ends
+T3 Code takes the profile's effort and `options` as model options (`t3 thread start --option effort=high`) only with
+`--provider` and `--model`; without them a notice says they are not applied. Its CLI has no child threads, no interrupt
+and no permission answers: `capabilities t3` says so, and `cancel` stops waiting while the thread keeps running in T3 Code. A thread that waits for an answer ends
 the turn with `waiting_for_answer` and a notice with the thread's link. When a session's owner died during a turn,
 the first turn after the resume follows the thread's run to its end instead of sending its prompt, so the agent
 doesn't work twice. The session's record notes each `t3 thread start` (`agent_session_asked`) until the new thread's

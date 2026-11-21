@@ -41,9 +41,9 @@ pub fn summary(spec: &AgentSpec) -> Value {
             "note": "Amp has no ACP server; each turn runs `amp --stream-json -x`, later turns `amp threads continue`",
         })),
         AgentKind::T3 => Some(json!({
-            "resume": true, "load": false, "cancel": false, "answer": false, "set": false, "model": "with --provider", "effort": false,
+            "resume": true, "load": false, "cancel": false, "answer": false, "set": false, "model": "with --provider", "effort": "with --provider and --model",
             "child_threads": false, "worktree": true, "permissions": "T3 Code's own runtime mode", "messages_while_running": "queued by T3",
-            "note": "T3 Code threads through `t3 thread start/send/show`; T3's CLI has no effort, child threads, interrupt or answers",
+            "note": "T3 Code threads through `t3 thread start/send/show`; effort and options go as `--option id=value` with a provider and model; T3's CLI has no child threads, interrupt or answers",
         })),
     };
     if let (Some(legacy), Some(map)) = (legacy, value.as_object_mut()) {

@@ -11,7 +11,8 @@
 //! title, and when that lookup fails it starts no thread and fails its turns until a later resume finds it. A thread that
 //! waits for an answer ends the turn with `waiting_for_answer`. A `t3` that fails while the thread still runs, or
 //! because the T3 Code server doesn't answer, doesn't end the turn: it follows the thread's run, waiting for the server
-//! up to [`SERVER_WAIT`]. T3's CLI has no effort setting, no child threads, no permission answers and no interrupt.
+//! up to [`SERVER_WAIT`]. The profile's effort and `options` go to T3 as model options (`--option id=value`), which T3
+//! takes only with a provider and model. T3's CLI has no child threads, no permission answers and no interrupt.
 //! [`settle`] moves a finished thread to T3's Settled group.
 
 use std::path::{Path, PathBuf};
@@ -52,8 +53,8 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
             start.record.project.as_deref().unwrap_or(Path::new("?")).display()
         )));
     }
-    if let Some(effort) = profile.effort {
-        reporter.notice(None, format!("T3's CLI has no effort setting; effort {effort} is not applied"));
+    if profile.provider.is_none() && (profile.effort.is_some() || !profile.options.is_empty()) {
+        reporter.notice(None, "T3 takes effort and model options only with a provider and model; they are not applied");
     }
     let (program, base_args) = start.spec.launch_command().await?;
     let cli = cli_of(&start, &program, &base_args);
@@ -165,6 +166,9 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
         }
         if let (Some(provider), Some(model)) = (&profile.provider, &profile.model) {
             args.extend(["--provider".into(), provider.clone(), "--model".into(), model.clone()]);
+            for (id, value) in model_options(&profile) {
+                args.extend(["--option".into(), format!("{id}={value}")]);
+            }
         }
         if let Some(base) = &profile.worktree_base {
             args.extend(["--worktree".into(), base.clone()]);
@@ -678,11 +682,35 @@ async fn launch(mcp: &mut Option<Mcp>, cli: &Cli, start: &Start, worktree: &Path
     });
     if let (Some(provider), Some(model)) = (&profile.provider, &profile.model) {
         arguments["modelSelection"] = json!({"instanceId": provider, "model": model});
+        let options: Vec<Value> = model_options(profile)
+            .into_iter()
+            .map(|(id, value)| {
+                // As `t3 thread start --option` sends them.
+                let value = match value.as_str() {
+                    "true" => json!(true),
+                    "false" => json!(false),
+                    _ => json!(value),
+                };
+                json!({"id": id, "value": value})
+            })
+            .collect();
+        if !options.is_empty() {
+            arguments["modelSelection"]["options"] = json!(options);
+        }
     }
     let launched = call(mcp, cli, "t3_thread_launch", arguments).await?;
     let text = |key: &str| launched.get(key).and_then(Value::as_str).map(str::to_string);
     let thread = text("threadId").ok_or_else(|| Error::Agent(format!("T3 Code's t3_thread_launch named no thread: {launched}")))?;
     Ok(Launched { thread, link: text("link"), run: text("runId") })
+}
+
+/// The profile's model options for T3 (`--option id=value`): its effort as `effort`, which wins over an `effort` in its
+/// `options` (T3 refuses an id given twice), then the `options`.
+fn model_options(profile: &crate::Profile) -> Vec<(String, String)> {
+    let effort = profile.effort.map(|effort| ("effort".to_string(), effort.to_string()));
+    let has_effort = effort.is_some();
+    let others = profile.options.iter().filter(|(id, _)| !has_effort || id.as_str() != "effort").map(|(id, value)| (id.clone(), value.clone()));
+    effort.into_iter().chain(others).collect()
 }
 
 /// The id of the T3 Code project whose workspace is `project`.
@@ -747,6 +775,17 @@ pub async fn settle(spec: &AgentSpec, record: &crate::registry::SessionRecord) -
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn effort_and_options_become_t3_model_options_with_effort_winning() {
+        let mut profile = crate::Profile { effort: Some(crate::profile::Effort::High), ..Default::default() };
+        profile.options.insert("effort".into(), "low".into());
+        profile.options.insert("fastMode".into(), "true".into());
+        let pair = |id: &str, value: &str| (id.to_string(), value.to_string());
+        assert_eq!(model_options(&profile), [pair("effort", "high"), pair("fastMode", "true")]);
+        profile.effort = None;
+        assert_eq!(model_options(&profile), [pair("effort", "low"), pair("fastMode", "true")]);
+    }
 
     #[test]
     fn stderr_names_the_thread_and_electron_noise_is_dropped() {
