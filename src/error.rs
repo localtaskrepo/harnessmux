@@ -11,6 +11,10 @@ pub enum Error {
     Agent(String),
     /// The agent spoke ACP but refused or failed a request.
     Protocol(String),
+    /// The agent refused to resume the session (`session/resume`, else `session/load`), such as one whose transcript is
+    /// gone; the message is the agent's. Other refusals while the session starts (`initialize`, `authenticate`, config
+    /// options) are [`Error::Protocol`].
+    NotResumable(String),
     /// Files, sockets and processes.
     Io(String, std::io::Error),
 }
@@ -26,7 +30,7 @@ impl Error {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Invalid(_) | Self::NoSession(_) => 64,
-            Self::Agent(_) | Self::Protocol(_) => 69,
+            Self::Agent(_) | Self::Protocol(_) | Self::NotResumable(_) => 69,
             Self::Io(..) => 74,
         }
     }
@@ -35,7 +39,7 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Invalid(message) | Self::Agent(message) | Self::Protocol(message) => f.write_str(message),
+            Self::Invalid(message) | Self::Agent(message) | Self::Protocol(message) | Self::NotResumable(message) => f.write_str(message),
             Self::NoSession(name) => write!(f, "no session named {name}; `harnessmux list` shows the sessions"),
             Self::Io(context, error) => write!(f, "{context}: {error}"),
         }

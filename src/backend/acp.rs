@@ -110,6 +110,11 @@ pub async fn run(start: Start, commands: mpsc::UnboundedReceiver<Command>, repor
     })
 }
 
+/// The agent's refusal of `session/resume` or `session/load`.
+fn not_resumable(error: agent_client_protocol::Error) -> Error {
+    Error::NotResumable(error.to_string())
+}
+
 /// The SDK error's message plus its data (where the driver's own errors go).
 fn describe(error: &agent_client_protocol::Error) -> String {
     match serde_json::to_value(error).ok().and_then(|value| value.get("data").and_then(Value::as_str).map(str::to_string)) {
@@ -307,7 +312,8 @@ impl Driver {
                             .meta(meta.clone()),
                     )
                     .block_task()
-                    .await?;
+                    .await
+                    .map_err(not_resumable)?;
                 return Ok(self.started(previous, "resumed", adapter_label, &json_of(&response)));
             }
             if caps.load_session {
@@ -319,7 +325,8 @@ impl Driver {
                             .meta(meta.clone()),
                     )
                     .block_task()
-                    .await?;
+                    .await
+                    .map_err(not_resumable)?;
                 // session/load replays the history as updates; the log already has it.
                 return Ok(self.started(previous, "loaded", adapter_label, &json_of(&response)));
             }

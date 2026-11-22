@@ -1,11 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 (2026-11-22)
 
+- An agent that refuses to resume or load the session (`session/resume`, `session/load`) makes `Session::resume` fail
+  with the new `Error::NotResumable` and the agent's message, so a caller can start a new session instead. Before, it
+  was `Error::Protocol`, like a refused `initialize` or `authenticate`, which still are. A library match on `Error`
+  without `_` needs the new variant (lotar DEV-777, HARN-25).
 - A t3 turn whose activity read fails mid-turn still sends the replies the activity saw running as `message.delta`
   from `t3 thread show`. Before, those were counted as sent and only came in the turn's final `message` (HARN-23).
-
-## 0.3.0 (2026-11-22)
 
 - An owner that takes over a session numbers its events after the log's last `seq`. Before, it counted on from the
   record's saved count, so after an owner was killed mid-turn the next owner's first events repeated seqs already in
