@@ -31,7 +31,7 @@ use super::{Command, Report, Reporter, Start, refuse};
 use crate::agents::AgentSpec;
 use crate::error::{Error, Result};
 use crate::event;
-use crate::event::{EventBody, Failure, FailureKind, StopReason, Usage};
+use crate::event::{EventBody, Failure, FailureKind, PlanEntry, StopReason, Usage};
 
 const POLL: Duration = Duration::from_secs(2);
 /// Failed `t3 thread show` reads in a row before following a run gives up.
@@ -643,6 +643,8 @@ struct Activity {
     sent: HashMap<String, bool>,
     /// The run's replies that ended in the activity: a fallback to `t3 thread show` sends the replies after them.
     replies: usize,
+    /// Each to-do list's text as last sent: a list sends a `plan` each time it changes.
+    plans: HashMap<String, String>,
     /// The activity couldn't be read in this turn.
     off: bool,
 }
@@ -718,6 +720,12 @@ impl Activity {
             }
             match kind_of(item) {
                 Kind::Skipped => {}
+                Kind::Plan => {
+                    if self.plans.get(id).map(String::as_str) != Some(item_text) {
+                        events.push((fill(EventBody::Plan { entries: Vec::new() }, item, item_text), item.clone()));
+                        self.plans.insert(id.to_string(), item_text.to_string());
+                    }
+                }
                 Kind::Text(text) => {
                     if ended {
                         if item.get("type").and_then(Value::as_str) == Some("assistant_message") {
@@ -762,10 +770,13 @@ fn ended(item: &Value) -> bool {
 }
 
 enum Kind {
-    /// The prompt, T3's own notes and checkpoints, and errors (which end a failed turn, [`errors_of`]).
+    /// The prompt, T3's own notes and checkpoints, errors (which end a failed turn, [`errors_of`]) and requests to the
+    /// user (a thread that waits on one ends the turn waiting, [`waiting`]).
     Skipped,
-    /// A reply or a thought: the event for its text.
+    /// A reply, a proposed plan (markdown) or a thought: the event for its text.
     Text(fn(String) -> EventBody),
+    /// A to-do list: a `plan` event each time it changes.
+    Plan,
     Tool {
         title: String,
         kind: Option<String>,
@@ -778,7 +789,10 @@ fn kind_of(item: &Value) -> Kind {
     let item_type = field("type").unwrap_or("tool");
     match item_type {
         "user_message" | "checkpoint" | "notification" | "error" => Kind::Skipped,
-        "assistant_message" => Kind::Text(|text| EventBody::MessageDelta { text }),
+        "system_notice" | "run_interrupt_request" | "run_interrupt_result" | "compaction" | "handoff" | "fork" | "thread_created" => Kind::Skipped,
+        "approval_request" | "user_input_request" | "secret_request" | "link_request" => Kind::Skipped,
+        "assistant_message" | "proposed_plan" => Kind::Text(|text| EventBody::MessageDelta { text }),
+        "todo_list" => Kind::Plan,
         "reasoning" => Kind::Text(|text| EventBody::ThoughtDelta { text }),
         "command_execution" => Kind::Tool { title: first_line().unwrap_or_else(|| item_type.into()), kind: Some("execute".into()) },
         "file_change" => {
@@ -799,13 +813,15 @@ fn kind_of(item: &Value) -> Kind {
 
 /// `body` with what `text`, the item's text, says (T3 Code's `turnItemText`): a reply's or thought's text; a tool's
 /// input and paths when it starts, its output when it ends. A command's text is `$ <command>` and its output; a file
-/// change's is its path, `+N -M` and the diff; another tool's is JSON with `toolName`, `input` and `output`.
+/// change's is its path, `+N -M` and the diff; a to-do list's is its explanation and a `[<status>] <step>` line per
+/// step; another tool's is JSON with `toolName`, `input` and `output`.
 fn fill(body: EventBody, item: &Value, text: &str) -> EventBody {
     let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
     let call = || (item_type == "dynamic_tool").then(|| serde_json::from_str::<Value>(text).ok()).flatten();
     match body {
         EventBody::MessageDelta { .. } => EventBody::MessageDelta { text: format!("{text}\n\n") },
         EventBody::ThoughtDelta { .. } => EventBody::ThoughtDelta { text: format!("{text}\n\n") },
+        EventBody::Plan { .. } => EventBody::Plan { entries: text.lines().filter_map(plan_entry).collect() },
         EventBody::ToolStarted { id, title, kind, .. } => {
             let input = call().and_then(|call| call.get("input").cloned()).filter(|input| !input.is_null());
             let path = (item_type == "file_change").then(|| text.lines().next().map(str::trim).filter(|path| !path.is_empty())).flatten();
@@ -830,6 +846,14 @@ fn fill(body: EventBody, item: &Value, text: &str) -> EventBody {
         }
         body => body,
     }
+}
+
+/// A to-do list's step from its `[<status>] <step>` line; T3's `running` is ACP's `in_progress`. The explanation line
+/// has no status and gives none.
+fn plan_entry(line: &str) -> Option<PlanEntry> {
+    let (status, content) = line.strip_prefix('[')?.split_once("] ")?;
+    let status = if status == "running" { "in_progress" } else { status };
+    Some(PlanEntry { content: content.trim().to_string(), status: status.to_string(), priority: String::new() })
 }
 
 /// The item's whole text, read on by its id where the activity read cut it off.
@@ -1152,6 +1176,40 @@ mod tests {
         assert_eq!(title(json!({"type": "file_change", "title": "edit", "text": "/work/repo/a.rs\n+1 -0\n@@ -1 +1,2 @@"})), "/work/repo/a.rs");
         assert_eq!(title(json!({"type": "file_change", "title": "write", "text": null})), "write");
         assert!(matches!(kind_of(&json!({"type": "error", "text": "limit"})), Kind::Skipped));
+    }
+
+    #[test]
+    fn t3s_notes_and_requests_send_nothing_and_its_searches_and_subagents_are_tools() {
+        let notes = ["system_notice", "run_interrupt_request", "run_interrupt_result", "compaction", "handoff", "fork", "thread_created"];
+        let requests = ["approval_request", "user_input_request", "secret_request", "link_request"];
+        for item_type in notes.into_iter().chain(requests) {
+            assert!(matches!(kind_of(&json!({"type": item_type, "text": "x"})), Kind::Skipped), "{item_type}");
+        }
+        for item_type in ["file_search", "web_search", "subagent", "dynamic_tool"] {
+            assert!(matches!(kind_of(&json!({"type": item_type, "text": "x"})), Kind::Tool { .. }), "{item_type}");
+        }
+        let Kind::Text(text) = kind_of(&json!({"type": "proposed_plan", "text": "# Plan"})) else { panic!() };
+        assert_eq!(text("# Plan".into()), EventBody::MessageDelta { text: "# Plan".into() });
+        assert!(matches!(kind_of(&json!({"type": "todo_list", "text": "[pending] a"})), Kind::Plan));
+    }
+
+    #[test]
+    fn a_t3_todo_list_is_a_plan_sent_each_time_it_changes() {
+        let item = |status: &str, text: &str| json!({"position": 1, "itemId": "p1", "runId": "r1", "type": "todo_list", "status": status, "title": null, "text": text});
+        let entry = |content: &str, status: &str| PlanEntry { content: content.into(), status: status.into(), priority: String::new() };
+        let mut activity = Activity::default();
+        let first = item("running", "Fix the tests first.\n[running] Run the tests\n[pending] Fix the failure");
+        assert_eq!(
+            activity.take(vec![first.clone()], "t1", "r1").into_iter().map(|(body, _)| body).collect::<Vec<_>>(),
+            [EventBody::Plan { entries: vec![entry("Run the tests", "in_progress"), entry("Fix the failure", "pending")] }]
+        );
+        assert!(activity.take(vec![first], "t1", "r1").is_empty());
+        let done = item("completed", "[completed] Run the tests\n[completed] Fix the failure");
+        assert_eq!(
+            activity.take(vec![done.clone()], "t1", "r1").into_iter().map(|(body, _)| body).collect::<Vec<_>>(),
+            [EventBody::Plan { entries: vec![entry("Run the tests", "completed"), entry("Fix the failure", "completed")] }]
+        );
+        assert!(activity.take(vec![done], "t1", "r1").is_empty());
     }
 
     #[test]

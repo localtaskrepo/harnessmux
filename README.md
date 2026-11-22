@@ -172,8 +172,13 @@ While a t3 turn runs, harnessmux reads the thread's activity (`t3_thread_read`, 
 sends the turn's run in T3's order: each command, file change and other tool as `tool.started` (id: T3's `itemId`;
 title: the command, the file's path, else the tool's title or name; kind `execute` for a command, `edit` for a file
 change; a file change's path in `locations`, another tool's `input`) and `tool.finished` once it ends (`completed`,
-else `failed`; `output`: a command's output, another tool's), each thought as `thought.delta` and each reply as `message.delta`, whole, once it has ended; `raw` is T3's item. The
-prompt, T3's own notes, checkpoints and errors send nothing, nor do the items of other threads. When the activity
+else `failed`; `output`: a command's output, another tool's), each thought as `thought.delta` and each reply and
+proposed plan (its markdown) as `message.delta`, whole, once it has ended; a to-do list as `plan` each time it changes
+(T3's step status `running` as `in_progress`); `raw` is T3's item. Searches (`file_search`, `web_search`) and subagents
+are tools too. The prompt, T3's own notes (`notification`, `system_notice`, `run_interrupt_*`, `compaction`,
+`handoff`, `fork`, `thread_created`), checkpoints, errors and its requests to the user (`approval_request`,
+`user_input_request`, `secret_request`, `link_request`: a thread that waits on one ends the turn waiting, as above)
+send nothing, nor do the items of other threads. When the activity
 can't be read, a notice says so and the rest of the turn streams the replies from `t3 thread show`. T3 Code shows no
 token usage, so a t3 turn sends no `usage`.
 
@@ -207,7 +212,7 @@ A tool's fields come from what its adapter sends. Claude starts a call with no i
 `tool.updated` (several, each with all input known so far); Codex sends it with `tool.started` and its title is the
 command. `output` is the tool's text content, else its `rawOutput` (JSON other than a string as compact JSON), else
 the command's output joined from codex-acp's terminal chunks; `raw` keeps the full output. Amp gives `input` and
-`output`; the t3 backend reports no tool calls.
+`output`; the t3 backend's come from the T3 Code thread's activity, as described above.
 
 A failed turn's `kind` comes from the adapter's error data where it sends some (claude-agent-acp: `data.errorKind`,
 `data.rateLimit.resetsAt`, ACP's `authRequired` code; codex-acp: `data.codexErrorInfo`, with the reason in `data.message`), else from the error text ("You've hit your usage limit",

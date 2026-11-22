@@ -8,6 +8,10 @@
   without `_` needs the new variant (lotar DEV-777, HARN-25).
 - A t3 turn whose activity read fails mid-turn still sends the replies the activity saw running as `message.delta`
   from `t3 thread show`. Before, those were counted as sent and only came in the turn's final `message` (HARN-23).
+- A t3 turn no longer reports T3 Code's own notes (`system_notice`, `run_interrupt_*`, `compaction`, `handoff`,
+  `fork`, `thread_created`) or its requests to the user (approvals, questions, secrets, links) as tool calls titled
+  with their type: they send nothing. A to-do list (`todo_list`) is a `plan` event each time it changes, and a
+  proposed plan a `message.delta` with its markdown (HARN-19).
 
 - An owner that takes over a session numbers its events after the log's last `seq`. Before, it counted on from the
   record's saved count, so after an owner was killed mid-turn the next owner's first events repeated seqs already in
