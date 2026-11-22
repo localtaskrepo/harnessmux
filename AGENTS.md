@@ -16,6 +16,8 @@ its design: lotar `docs/developers/harness-tool-design.md`.
 - Release: bump `version` in Cargo.toml and CHANGELOG.md, commit, tag `vX.Y.Z` (signed), push the tag. release.yml
   builds the binaries, makes the GitHub release and publishes the crate through crates.io trusted publishing
   (environment `release`, v* tags only); no token is stored.
+  Agents release when needed, without asking the owner (owner 2026-11-22: "Releases of harnessmux can from now on be
+  done by agents when needed. No need to wait for my green light. Lotar releases should still ask me.").
 
 ## Differences from the global standards
 - Hooks: none in the repo (public, self-contained); CI runs fmt, clippy, nextest on Linux, macOS and Windows, deny.
