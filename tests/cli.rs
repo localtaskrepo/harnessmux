@@ -522,7 +522,7 @@ fn base64url(bytes: &[u8]) -> String {
 /// `pair-1`, PKCE checked) and `/mcp`. `t3_thread_launch` returns thread t1 (the same thread for a repeated
 /// `clientRequestId`), or fails with the text in `launch-error`; `t3_thread_send` and the launch name run r2;
 /// `t3_thread_read` pages the items in `activity.json` (without it, the assistant replies in `show.json`; from the second
-/// page read on, also those in `activity-more.json`) as T3 Code does for a client outside a thread: the oldest `limit` without a position, the newest `limit` before
+/// page read on, also those in `activity-more.json`; a page read after the number in `read-fail-after` fails) as T3 Code does for a client outside a thread: the oldest `limit` without a position, the newest `limit` before
 /// `beforePosition`, the oldest `limit` after `afterPosition`, an item's text from `textOffset` with `itemId`; texts are
 /// cut at `maxCharsPerItem`. Each
 /// sign-in step and tool call is appended to `calls` (`oauth token`, `mcp <tool> <arguments>`). Once `revoke` exists,
@@ -618,6 +618,13 @@ fn fake_t3_server(dir: &Path, project: &Path) -> String {
                                 }
                             },
                             "t3_thread_send" => Ok(thread(arguments["threadId"].as_str().unwrap())),
+                            "t3_thread_read"
+                                if arguments.get("itemId").is_none()
+                                    && std::fs::read_to_string(dir.join("read-fail-after"))
+                                        .is_ok_and(|after| page_reads >= after.trim().parse::<usize>().unwrap()) =>
+                            {
+                                Err("Thread read failed".to_string())
+                            }
                             "t3_thread_read" => {
                                 // The activity holds the replies `thread show` prints, unless `activity.json` says what it holds.
                                 let mut items: Vec<Value> = match std::fs::read_to_string(dir.join("activity.json")) {
@@ -830,6 +837,26 @@ fn a_t3_turn_whose_activity_cant_be_read_still_streams_its_replies() {
     let notices: Vec<&Value> = events.iter().filter(|e| e["type"] == "notice").collect();
     assert_eq!(notices.len(), 1, "{events:?}");
     assert!(notices[0]["text"].as_str().unwrap().contains("shows its replies but not its tool calls"), "{events:?}");
+    let replies: Vec<&Value> = events.iter().filter(|e| e["type"] == "message.delta").collect();
+    assert_eq!(replies.len(), 1, "{events:?}");
+    assert_eq!(replies[0]["text"], "Working\n\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_t3_reply_still_running_when_the_activity_read_fails_streams_once_from_thread_show() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    std::fs::write(dir.join("start-exit"), "0").unwrap();
+    show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r2","text":"Working"}]"#);
+    // The first read shows the reply still running; the next one fails.
+    let reply = serde_json::json!({"itemId": "m1", "runId": "r2", "type": "assistant_message", "status": "running", "text": "Work"});
+    std::fs::write(dir.join("activity.json"), Value::from(vec![reply]).to_string()).unwrap();
+    std::fs::write(dir.join("read-fail-after"), "1").unwrap();
+    let run = home.run(&["run", "t3", "--name", "r", "--provider", "claudeAgent", "--model", "m", "Fix it"]);
+    assert!(run.status.success(), "{}", text(&run));
+    let events = home.events("r");
+    assert!(events.iter().any(|e| e["type"] == "notice" && e["text"].as_str().unwrap().contains("shows its replies but not its tool calls")), "{events:?}");
     let replies: Vec<&Value> = events.iter().filter(|e| e["type"] == "message.delta").collect();
     assert_eq!(replies.len(), 1, "{events:?}");
     assert_eq!(replies[0]["text"], "Working\n\n");

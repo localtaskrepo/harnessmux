@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- A t3 turn whose activity read fails mid-turn still sends the replies the activity saw running as `message.delta`
+  from `t3 thread show`. Before, those were counted as sent and only came in the turn's final `message` (HARN-23).
+
 ## 0.3.0 (2026-11-22)
 
 - An owner that takes over a session numbers its events after the log's last `seq`. Before, it counted on from the

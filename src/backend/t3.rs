@@ -641,6 +641,8 @@ struct Activity {
     after: Option<i64>,
     /// The run's items sent so far, and whether each has ended.
     sent: HashMap<String, bool>,
+    /// The run's replies that ended in the activity: a fallback to `t3 thread show` sends the replies after them.
+    replies: usize,
     /// The activity couldn't be read in this turn.
     off: bool,
 }
@@ -718,6 +720,9 @@ impl Activity {
                 Kind::Skipped => {}
                 Kind::Text(text) => {
                     if ended {
+                        if item.get("type").and_then(Value::as_str) == Some("assistant_message") {
+                            self.replies += 1;
+                        }
                         if !item_text.trim().is_empty() {
                             events.push((fill(text(String::new()), item, item_text), item.clone()));
                         }
@@ -847,7 +852,11 @@ async fn full_text(mcp: &mut Option<Mcp>, cli: &Cli, thread: &str, item: &Value)
 /// activity is read only once `current`, the turn's run, shows.
 #[expect(clippy::too_many_arguments, reason = "the run loop's state, passed down")]
 async fn stream(mcp: &mut Option<Mcp>, cli: &Cli, thread: &str, shown: &Value, current: bool, follow: &mut Follow, turn: u64, reporter: &Reporter) {
-    // Read on every poll, so a fallback starts after the replies the activity sent.
+    // While the activity follows the run, `t3 thread show`'s replies count from the last one that ended in it, so a
+    // fallback also sends those the activity saw still running.
+    if !follow.activity.off && follow.activity.run.is_some() && follow.activity.run == follow.run {
+        follow.seen = follow.activity.replies;
+    }
     let replies = follow.take_new(shown);
     let activity = &mut follow.activity;
     if !activity.off
