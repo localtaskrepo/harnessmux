@@ -864,6 +864,25 @@ fn a_t3_reply_still_running_when_the_activity_read_fails_streams_once_from_threa
 
 #[cfg(unix)]
 #[test]
+fn a_t3_reply_the_activity_sent_before_its_read_fails_doesnt_come_again_from_thread_show() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    std::fs::write(dir.join("start-exit"), "0").unwrap();
+    show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r2","text":"First"},{"role":"assistant","runId":"r2","text":"Second"}]"#);
+    // The first read sends the first reply; the next one fails.
+    let reply = serde_json::json!({"itemId": "m1", "runId": "r2", "type": "assistant_message", "status": "completed", "text": "First"});
+    std::fs::write(dir.join("activity.json"), Value::from(vec![reply]).to_string()).unwrap();
+    std::fs::write(dir.join("read-fail-after"), "1").unwrap();
+    let run = home.run(&["run", "t3", "--name", "s", "--provider", "claudeAgent", "--model", "m", "Fix it"]);
+    assert!(run.status.success(), "{}", text(&run));
+    let events = home.events("s");
+    assert!(events.iter().any(|e| e["type"] == "notice" && e["text"].as_str().unwrap().contains("shows its replies but not its tool calls")), "{events:?}");
+    let replies: Vec<&str> = events.iter().filter(|e| e["type"] == "message.delta").map(|e| e["text"].as_str().unwrap()).collect();
+    assert_eq!(replies, ["First\n\n", "Second\n\n"], "{events:?}");
+}
+
+#[cfg(unix)]
+#[test]
 fn a_t3_thread_waiting_for_an_answer_ends_the_turn_with_its_link() {
     let home = home(&[]);
     let dir = fake_t3(&home);
