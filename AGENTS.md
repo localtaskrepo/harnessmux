@@ -17,7 +17,9 @@ its design: lotar `docs/developers/harness-tool-design.md`.
   builds the binaries, makes the GitHub release and publishes the crate through crates.io trusted publishing
   (environment `release`, v* tags only); no token is stored.
   Agents release when needed, without asking the owner (owner 2026-11-22: "Releases of harnessmux can from now on be
-  done by agents when needed. No need to wait for my green light. Lotar releases should still ask me.").
+  done by agents when needed. No need to wait for my green light. Lotar releases should still ask me."). Later that
+  day lotar patch releases stopped asking him too; lotar minor and major releases still do (STD-311, standards
+  docs/decisions/2026-11-22-releases.md).
 
 ## Differences from the global standards
 - Hooks: none in the repo (public, self-contained); CI runs fmt, clippy, nextest on Linux, macOS and Windows, deny.
