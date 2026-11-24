@@ -11,6 +11,9 @@ env:
   BIN_NAME: harnessmux
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   ci:
     uses: ./.github/workflows/ci.yml
