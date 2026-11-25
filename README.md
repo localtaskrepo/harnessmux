@@ -216,8 +216,9 @@ the command's output joined from codex-acp's terminal chunks; `raw` keeps the fu
 
 A failed turn's `kind` comes from the adapter's error data where it sends some (claude-agent-acp: `data.errorKind`,
 `data.rateLimit.resetsAt`, ACP's `authRequired` code; codex-acp: `data.codexErrorInfo`, with the reason in `data.message`), else from the error text ("You've hit your usage limit",
-"Not logged in", "Overloaded", …). Only the error data gives `resets_at`, an RFC 3339 UTC time; a reset time in the text
-is not read. `retryable` is true for rate_limited, overloaded and transport: the same prompt can succeed later (after
+"Not logged in", "Overloaded", …). The error data gives `resets_at`, an RFC 3339 UTC time; a reset time in the error
+text is not read. The t3 backend takes it from T3 Code's usage-limit notice (`system_notice`) instead: the Unix seconds
+its itemId ends in, else its "resets in 31h 5m" counted from the notice's `updatedAt`. `retryable` is true for rate_limited, overloaded and transport: the same prompt can succeed later (after
 `resets_at`) without anyone changing anything.
 
 ## Library

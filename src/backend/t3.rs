@@ -363,7 +363,13 @@ async fn follow_run(
     } else {
         let status = format!("the T3 Code thread's run ended with status '{}'", state.status);
         match run_errors(mcp, cli, thread, state.run.as_deref()).await {
-            Ok(errors) if !errors.is_empty() => EventBody::failed(format!("{status}: {errors} ({link})")),
+            Ok((errors, resets_at)) if !errors.is_empty() => {
+                let mut failure = Failure::from_text(format!("{status}: {errors} ({link})"));
+                if failure.kind == FailureKind::RateLimited {
+                    failure.resets_at = resets_at;
+                }
+                failure.into()
+            }
             Ok(_) => EventBody::failed(format!("{status}: {link}")),
             Err(error) => {
                 reporter.notice(Some(turn), format!("could not read the T3 Code thread's activity for its error: {error}"));
@@ -376,22 +382,56 @@ async fn follow_run(
 }
 
 /// The error items T3 Code's thread activity (`t3_thread_read`) holds for `run`, such as the provider's rate limit,
-/// as one text; `t3 thread show` has none. The newest items: without `beforePosition`, T3 gives a client outside a
-/// thread the oldest ones, which miss the error of a run that did some work first.
-async fn run_errors(mcp: &mut Option<Mcp>, cli: &Cli, thread: &str, run: Option<&str>) -> Result<String> {
+/// as one text, and when its usage-limit notice says the limit resets; `t3 thread show` has neither. The newest items:
+/// without `beforePosition`, T3 gives a client outside a thread the oldest ones, which miss the error of a run that
+/// did some work first.
+async fn run_errors(mcp: &mut Option<Mcp>, cli: &Cli, thread: &str, run: Option<&str>) -> Result<(String, Option<String>)> {
     let arguments = json!({"threadId": thread, "view": "activity", "limit": 20, "maxCharsPerItem": 2000, "beforePosition": NEWEST});
     let read = call(mcp, cli, "t3_thread_read", arguments).await?;
-    Ok(errors_of(&read, run))
+    Ok((errors_of(&read, run), resets_of(&read, run)))
 }
 
-fn errors_of(read: &Value, run: Option<&str>) -> String {
-    let errors: Vec<String> = read
-        .get("items")
+/// `run`'s activity items of `kind`.
+fn items_of<'a>(read: &'a Value, run: Option<&'a str>, kind: &'a str) -> impl Iterator<Item = &'a Value> {
+    read.get("items")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter(|item| item.get("type").and_then(Value::as_str) == Some("error"))
-        .filter(|item| run.is_none_or(|run| item.get("runId").and_then(Value::as_str) == Some(run)))
+        .filter(move |item| item.get("type").and_then(Value::as_str) == Some(kind))
+        .filter(move |item| run.is_none_or(|run| item.get("runId").and_then(Value::as_str) == Some(run)))
+}
+
+/// When the usage limit resets, from T3's own `system_notice` for it ("Claude usage limit reached. This turn is paused
+/// until the 7-day limit resets in 31h 5m."): the Unix seconds its itemId ends in (`…usage-limit…:seven_day:1795536000`),
+/// else the text's "resets in" from the notice's `updatedAt`.
+fn resets_of(read: &Value, run: Option<&str>) -> Option<String> {
+    let notice =
+        items_of(read, run, "system_notice").filter(|item| item.get("itemId").and_then(Value::as_str).is_some_and(|id| id.contains("usage-limit"))).last()?;
+    let from_id =
+        notice.get("itemId").and_then(Value::as_str).and_then(|id| id.rsplit(':').next()).and_then(|secs| secs.parse::<u64>().ok()).filter(|secs| *secs > 0);
+    let from_text = || {
+        let text = notice.get("text").and_then(Value::as_str)?;
+        let after = text.split("resets in ").nth(1)?;
+        let mut secs = 0;
+        for part in after.trim_end_matches('.').split_whitespace() {
+            let unit = match part.chars().last()? {
+                'd' => 86_400,
+                'h' => 3_600,
+                'm' => 60,
+                's' => 1,
+                _ => break,
+            };
+            let Ok(count) = part[..part.len() - 1].parse::<u64>() else { break };
+            secs += count * unit;
+        }
+        let since = event::parse_rfc3339(notice.get("updatedAt").and_then(Value::as_str)?)?;
+        (secs > 0).then_some(since + secs)
+    };
+    from_id.or_else(from_text).map(|secs| event::format_rfc3339(secs, 0))
+}
+
+fn errors_of(read: &Value, run: Option<&str>) -> String {
+    let errors: Vec<String> = items_of(read, run, "error")
         .filter_map(|item| {
             let field = |key: &str| item.get(key).and_then(Value::as_str).map(str::trim).filter(|text| !text.is_empty());
             match (field("title"), field("text")) {
@@ -1071,6 +1111,25 @@ pub async fn settle(spec: &AgentSpec, record: &crate::registry::SessionRecord) -
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn usage_limit_notice_gives_the_reset() {
+        // The items of a run T3 Code paused on Claude's weekly limit (2026-11-23, lotar DEV-855), ids shortened.
+        let notice = |id: &str| {
+            json!({"runId": "r1", "type": "system_notice", "itemId": id, "updatedAt": "2026-11-23T08:55:39.479Z",
+                "text": "Claude usage limit reached. This turn is paused until the 7-day limit resets in 31h 5m."})
+        };
+        let error = json!({"runId": "r1", "type": "error", "itemId": "turn-item:terminal-failure:r1", "title": "Usage limit reached",
+            "text": "Claude API rate limit reached. Try again later."});
+        let read = json!({"items": [notice("turn-item:provider:claudeAgent:native-item:usage-limit%3Aprovider-turn%3Ar1:seven_day:1795536000"), error]});
+        assert_eq!(errors_of(&read, Some("r1")), "Usage limit reached: Claude API rate limit reached. Try again later.");
+        assert_eq!(resets_of(&read, Some("r1")).as_deref(), Some("2026-11-24T16:00:00.000Z"));
+        assert_eq!(resets_of(&read, Some("r2")), None);
+        // Without the epoch in its id, the text's "resets in" counts from the notice.
+        let read = json!({"items": [notice("turn-item:usage-limit:r1"), error]});
+        assert_eq!(resets_of(&read, Some("r1")).as_deref(), Some("2026-11-24T16:00:39.000Z"));
+        assert_eq!(resets_of(&json!({"items": [error]}), Some("r1")), None);
+    }
 
     #[test]
     fn effort_and_options_become_t3_model_options_with_effort_winning() {

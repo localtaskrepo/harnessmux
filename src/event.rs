@@ -278,9 +278,36 @@ pub(crate) fn format_rfc3339(secs: u64, millis: u32) -> String {
     format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z", rem / 3_600, rem % 3_600 / 60, rem % 60)
 }
 
+/// Unix seconds of a UTC RFC 3339 time such as `2026-11-23T08:55:39.479Z` (the inverse of [`format_rfc3339`]).
+pub(crate) fn parse_rfc3339(time: &str) -> Option<u64> {
+    let (date, clock) = time.strip_suffix('Z')?.split_once('T')?;
+    let number = |text: &str| text.parse::<i64>().ok();
+    let mut date = date.splitn(3, '-').map(number);
+    let (year, month, day) = (date.next()??, date.next()??, date.next()??);
+    let mut clock = clock.splitn(3, ':');
+    let (hour, minute) = (number(clock.next()?)?, number(clock.next()?)?);
+    let second = number(clock.next()?.split('.').next()?)?;
+    // Days since 1970-01-01 from a civil date (Howard Hinnant's algorithm).
+    let year = year - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let yoe = year.rem_euclid(400);
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + hour * 3_600 + minute * 60 + second).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_rfc3339() {
+        assert_eq!(parse_rfc3339("2026-11-13T22:45:12.815Z"), Some(1_794_609_912));
+        assert_eq!(parse_rfc3339("2000-02-29T00:00:00Z"), Some(951_782_400));
+        assert_eq!(parse_rfc3339("1970-01-01T00:00:00.000Z"), Some(0));
+        assert_eq!(parse_rfc3339("2026-11-13 22:45:12"), None);
+    }
 
     #[test]
     fn times_are_rfc3339() {

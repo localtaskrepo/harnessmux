@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1 (2026-11-25)
+
+- A t3 turn that fails on a usage limit reports `resets_at` from T3 Code's own usage-limit notice: the Unix time its
+  item id ends in, else its "resets in 31h 5m" counted from the notice. Before, it had none, so a caller retried
+  instead of waiting for the reset (lotar DEV-855, HARN-31).
+
 ## 0.3.0 (2026-11-22)
 
 - An agent that refuses to resume or load the session (`session/resume`, `session/load`) makes `Session::resume` fail
