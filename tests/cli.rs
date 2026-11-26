@@ -454,7 +454,7 @@ fn start_errors_reach_the_caller_and_leave_no_session() {
 
 /// A fake `t3` CLI in `dir`: `thread start` names thread t1, prints `start-error` (if any) to stderr and exits with
 /// the code in `start-exit` after `start-sleep` seconds, `thread show` prints `show.json`, `thread list` prints
-/// `list.json` (or fails while `list-fail` exists), `auth pairing create` prints pairing code `pair-1` (fails while
+/// `list.json` (or fails while `list-fail` exists), `environment list` prints `env.json`, `auth pairing create` prints pairing code `pair-1` (fails while
 /// `pairing-fail` exists); every call is appended to `calls`, and `thread start`'s arguments are written to `start-args`. While `down` holds a number above 0, `thread show` counts
 /// it down and fails as T3's CLI does when its server is down. A [`fake_t3_server`] answers T3 Code's MCP endpoint.
 #[cfg(unix)]
@@ -473,6 +473,7 @@ case "$1 $2" in
   "auth pairing")
     if [ -f "$dir/pairing-fail" ]; then echo "Could not reach the T3 Code server at http://127.0.0.1:3773" >&2; exit 1; fi
     echo '{"credential":"pair-1","expiresAt":"2026-01-01T00:02:00.000Z","id":"p","label":"harnessmux","scopes":[]}' ;;
+  "environment list") cat "$dir/env.json" ;;
   "thread list")
     if [ -f "$dir/list-fail" ]; then echo "Could not reach the T3 Code server at http://127.0.0.1:3773" >&2; exit 1; fi
     cat "$dir/list.json" ;;
@@ -524,7 +525,8 @@ fn base64url(bytes: &[u8]) -> String {
 /// `t3_thread_read` pages the items in `activity.json` (without it, the assistant replies in `show.json`; from the second
 /// page read on, also those in `activity-more.json`; a page read after the number in `read-fail-after` fails) as T3 Code does for a client outside a thread: the oldest `limit` without a position, the newest `limit` before
 /// `beforePosition`, the oldest `limit` after `afterPosition`, an item's text from `textOffset` with `itemId`; texts are
-/// cut at `maxCharsPerItem`. Each
+/// cut at `maxCharsPerItem`. View `messages` returns the thread and messages of `show.json` (a thread that is gone once
+/// `gone` exists). Each
 /// sign-in step and tool call is appended to `calls` (`oauth token`, `mcp <tool> <arguments>`). Once `revoke` exists,
 /// the next `/mcp` request finds every token revoked (and removes the file). Returns the origin.
 #[cfg(unix)]
@@ -645,6 +647,22 @@ fn fake_t3_server(dir: &Path, project: &Path) -> String {
                                         .is_ok_and(|after| page_reads >= after.trim().parse::<usize>().unwrap()) =>
                             {
                                 Err("Thread read failed".to_string())
+                            }
+                            "t3_thread_read" if arguments["view"] == "messages" => {
+                                if dir.join("gone").exists() {
+                                    Err(format!("Thread {} is no longer available.", arguments["threadId"].as_str().unwrap()))
+                                } else {
+                                    let show: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("show.json")).unwrap()).unwrap();
+                                    let kind = |role: &Value| if role == "user" { "user_message" } else { "assistant_message" };
+                                    let items: Vec<Value> = show["messages"]
+                                        .as_array()
+                                        .unwrap()
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(n, m)| serde_json::json!({"position": n, "itemId": format!("m{n}"), "runId": m["runId"], "type": kind(&m["role"]), "text": m["text"]}))
+                                        .collect();
+                                    Ok(serde_json::json!({"thread": show["thread"], "items": items, "hasMore": false}))
+                                }
                             }
                             "t3_thread_read" => {
                                 // The activity holds the replies `thread show` prints, unless `activity.json` says what it holds.
@@ -1670,4 +1688,138 @@ fn settle_moves_a_finished_t3_thread_to_settled_and_keeps_one_that_needs_a_look(
     assert!(settled.status.success(), "{}", text(&settled));
     assert!(String::from_utf8_lossy(&settled.stdout).contains("https://t3/t1"), "{}", text(&settled));
     assert_eq!(mcp_calls(&dir, "t3_thread_organize"), vec![serde_json::json!({"threadId": "t1", "action": "settle"})]);
+}
+
+/// `env.json` for [`fake_t3`]: the linked environment dyson, in `status`.
+#[cfg(unix)]
+fn linked(dir: &Path, status: &str) {
+    let env = serde_json::json!([{"environmentId": "env-dyson", "label": "dyson", "status": status, "lastError": if status == "reachable" { Value::Null } else { "connect ECONNREFUSED".into() }}]);
+    std::fs::write(dir.join("env.json"), env.to_string()).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_t3_session_on_a_linked_environment_launches_and_follows_its_thread_there_through_mcp() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    linked(&dir, "reachable");
+    show(&dir, "completed", "null", 0, r#"[{"role":"user","runId":"r2","text":"Fix it"},{"role":"assistant","runId":"r2","text":"Done."}]"#);
+    let run = home.run(&["run", "t3", "--name", "d", "--environment", "dyson", "--provider", "claudeAgent", "--model", "m", "--title", "DEV-1 Fix", "Fix it"]);
+    assert!(run.status.success(), "{}", text(&run));
+    assert!(String::from_utf8_lossy(&run.stdout).contains("Done."), "{}", text(&run));
+
+    let launches = mcp_calls(&dir, "t3_thread_launch");
+    assert_eq!(launches.len(), 1, "{launches:?}");
+    assert_eq!(launches[0]["workspaceStrategy"], serde_json::json!({"type": "root"}), "{}", launches[0]);
+    assert_eq!(launches[0]["projectId"], "p1");
+    let record: Value = serde_json::from_str(&std::fs::read_to_string(home.dir.path().join("state/sessions/d.json")).unwrap()).unwrap();
+    assert_eq!(record["profile"]["environment"], "dyson", "{record}");
+
+    let next = home.run(&["send", "d", "--wait", "Go on"]);
+    assert!(next.status.success(), "{}", text(&next));
+    assert_eq!(mcp_calls(&dir, "t3_thread_send").len(), 1);
+
+    // Every tool call names the environment; T3's CLI only lists the environments and pairs, and no events are asked for.
+    let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+    let tools: Vec<&str> = calls.lines().filter(|line| line.starts_with("mcp ")).collect();
+    assert!(tools.iter().any(|line| line.starts_with("mcp t3_thread_read ")), "{calls}");
+    for line in &tools {
+        let arguments: Value = serde_json::from_str(line.splitn(3, ' ').nth(2).unwrap()).unwrap();
+        assert_eq!(arguments["environmentId"], "env-dyson", "{line}");
+    }
+    let cli: Vec<&str> = calls.lines().filter(|line| !line.starts_with("mcp ") && !line.starts_with("oauth ") && !line.starts_with("events ")).collect();
+    assert!(cli.iter().all(|line| matches!(*line, "environment list" | "auth pairing")), "{calls}");
+    assert!(!calls.contains("events "), "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_t3_session_on_a_linked_environment_starts_its_worktree_there_from_the_base() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    linked(&dir, "reachable");
+    show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r2","text":"Done."}]"#);
+    let run = home.run(&[
+        "run",
+        "t3",
+        "--name",
+        "b",
+        "--environment",
+        "env-dyson",
+        "--worktree",
+        "main",
+        "--branch",
+        "agent/DEV-1",
+        "--provider",
+        "claudeAgent",
+        "--model",
+        "m",
+        "Fix it",
+    ]);
+    assert!(run.status.success(), "{}", text(&run));
+    let launch = &mcp_calls(&dir, "t3_thread_launch")[0];
+    assert_eq!(launch["workspaceStrategy"], serde_json::json!({"type": "worktree", "baseRef": "main", "branch": "agent/DEV-1"}), "{launch}");
+    assert_eq!(launch["environmentId"], "env-dyson", "{launch}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_t3_session_on_an_unknown_unreachable_or_projectless_environment_doesnt_start() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    linked(&dir, "unreachable");
+    let down = home.run(&["run", "t3", "--name", "u", "--environment", "dyson", "--provider", "claudeAgent", "--model", "m", "Fix it"]);
+    assert!(!down.status.success(), "{}", text(&down));
+    assert!(text(&down).contains("the T3 Code environment dyson doesn't answer (status 'unreachable': connect ECONNREFUSED)"), "{}", text(&down));
+
+    let unknown = home.run(&["run", "t3", "--name", "k", "--environment", "nyx", "--provider", "claudeAgent", "--model", "m", "Fix it"]);
+    assert!(!unknown.status.success(), "{}", text(&unknown));
+    assert!(text(&unknown).contains("T3 Code has no linked environment nyx (linked: dyson)"), "{}", text(&unknown));
+
+    linked(&dir, "reachable");
+    let elsewhere = home.dir.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let none = home.run(&[
+        "run",
+        "t3",
+        "--name",
+        "n",
+        "--environment",
+        "dyson",
+        "--cwd",
+        elsewhere.to_str().unwrap(),
+        "--provider",
+        "claudeAgent",
+        "--model",
+        "m",
+        "Fix it",
+    ]);
+    assert!(!none.status.success(), "{}", text(&none));
+    assert!(text(&none).contains("the T3 Code environment dyson has no project for"), "{}", text(&none));
+
+    assert!(mcp_calls(&dir, "t3_thread_launch").is_empty());
+    let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+    assert!(!calls.contains("thread start") && !calls.contains("thread show"), "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
+fn settle_reads_and_settles_a_t3_thread_on_its_linked_environment() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    linked(&dir, "reachable");
+    show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r2","text":"Done."}]"#);
+    let run = home.run(&["run", "t3", "--name", "s", "--environment", "dyson", "--provider", "claudeAgent", "--model", "m", "Fix it"]);
+    assert!(run.status.success(), "{}", text(&run));
+
+    std::fs::write(dir.join("gone"), "").unwrap();
+    let gone = home.run(&["settle", "s"]);
+    assert!(!gone.status.success(), "{}", text(&gone));
+    assert!(text(&gone).contains("could not read the T3 Code thread t1 with t3_thread_read"), "{}", text(&gone));
+    std::fs::remove_file(dir.join("gone")).unwrap();
+
+    let settled = home.run(&["settle", "s"]);
+    assert!(settled.status.success(), "{}", text(&settled));
+    assert_eq!(mcp_calls(&dir, "t3_thread_organize"), vec![serde_json::json!({"threadId": "t1", "action": "settle", "environmentId": "env-dyson"})]);
+    assert_eq!(count_calls(&dir, "thread show"), 0);
 }

@@ -75,6 +75,9 @@ pub struct RunArgs {
     /// t3: the branch for that worktree.
     #[arg(long)]
     branch: Option<String>,
+    /// t3: run the thread on this linked T3 Code environment, by id or label (`t3 environment list`).
+    #[arg(long, value_name = "ID|LABEL")]
+    environment: Option<String>,
     /// Session title (t3 thread title).
     #[arg(long)]
     title: Option<String>,
@@ -141,6 +144,7 @@ fn profile(args: &RunArgs) -> Result<Profile> {
         provider: args.provider.clone(),
         worktree_base: args.worktree.clone(),
         branch: args.branch.clone(),
+        environment: args.environment.clone(),
         title: args.title.clone(),
         output_schema: args.output_schema.as_deref().map(read_schema).transpose()?,
         ..Profile::default()

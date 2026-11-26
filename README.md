@@ -129,7 +129,7 @@ command = ["my-agent", "--acp"]
 | claude | `claude-agent-acp` 0.107.0 | run live: new, send, resume after the owner was killed, cancel |
 | codex | `codex-acp` 2.6.0 | run live: new, send, effort |
 | copilot | `copilot --acp --stdio` (1.0.111) | run live: one turn, a model error reported as `turn.failed` |
-| t3 | `t3 thread start/show` and T3 Code's MCP server (T3 Code 0.1.10; the activity 0.1.11; events and results 0.1.12) | run live: new thread, a thread in an existing worktree, a later turn, a repeated launch and send, settle, tool calls from the activity, milestones and an output schema |
+| t3 | `t3 thread start/show` and T3 Code's MCP server (T3 Code 0.1.10; the activity 0.1.11; events and results 0.1.12) | run live: new thread, a thread in an existing worktree, a later turn, a repeated launch and send, settle, tool calls from the activity, milestones and an output schema; a linked environment (`--environment`) not yet |
 | gemini | `gemini --acp` | from its docs, not run live |
 | cursor | `cursor-agent acp` | from its docs, not run live |
 | droid | `droid exec --output-format acp` | from its docs, not run live |
@@ -167,6 +167,15 @@ never shown or logged) and trades it for an OAuth token, kept for 30 days in `<s
 the user only). T3 Code lists it as session `harnessmux`; `t3 auth session revoke <id>` ends it, and the next turn
 signs in again. The server's address comes from T3 Code's `userdata/server-runtime.json` (`T3CODE_HOME`, default
 `~/.t3`).
+
+`--environment <id|label>` (profile `environment`) runs the session's thread on a linked T3 Code environment (`t3
+environment list`; an id wins over a label), such as another machine. This machine's T3 Code server relays every MCP
+call there (`environmentId`), and T3's CLI and MCP events reach only this machine, so such a session uses only MCP
+tools: its first turn is `t3_thread_launch` (the session's worktree; else a new worktree from `--worktree`; else the
+project's checkout), the thread is read with `t3_thread_read` (view `messages`) and a turn follows its run by reading it
+every 2 seconds. A failed read waits up to 60 minutes for the environment; a thread that is gone there fails the turn.
+An environment that isn't linked or reachable, or that has no project for the session's path (the same absolute path
+there), fails the start with its label before any thread is made; the session never runs on this machine instead.
 
 While a t3 turn runs, harnessmux reads the thread's activity (`t3_thread_read`, view `activity`) every 2 seconds and
 sends the turn's run in T3's order: each command, file change and other tool as `tool.started` (id: T3's `itemId`;

@@ -7,6 +7,7 @@
 //! 30 days; it is kept in `t3-credential.json` in the state directory (0600) and reused while valid. An expired token,
 //! or one `/mcp` refuses, signs in again. T3 Code lists the sign-in as a session labelled `harnessmux`
 //! (`t3 auth session list`; `t3 auth session revoke <id>` ends it). The pairing code and the token are never printed.
+//! A session on a linked environment signs in here too: this server relays a call that names the environment.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -42,6 +43,15 @@ pub struct Cli {
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub cwd: PathBuf,
+    /// The linked T3 Code environment the session's tool calls name; none: this machine's T3 Code.
+    pub environment: Option<Environment>,
+}
+
+/// A linked T3 Code environment (`t3 environment list`), reached through this machine's T3 Code server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Environment {
+    pub id: String,
+    pub label: String,
 }
 
 /// The kept sign-in. No `Debug`: it holds the token.

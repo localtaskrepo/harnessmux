@@ -1,6 +1,6 @@
 [package]
 name = "harnessmux"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.99"
 description = "Run coding-agent CLI sessions (Claude, Codex, Copilot, Gemini, Kilo and more) over the Agent Client Protocol: named sessions, send, attach, resume, cancel, one model/effort/permission mapping and a JSONL event stream"

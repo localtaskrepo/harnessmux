@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.1 (2026-11-26)
+
+- A t3 session can run its thread on a linked T3 Code environment: `run --environment <id|label>` (profile
+  `environment`). Every MCP call names it; its first turn is `t3_thread_launch`, reads are `t3_thread_read` and turns
+  follow the run by polling, as T3's CLI and events reach only the local server. An unknown or unreachable
+  environment, or one without the session's project, fails the start. A `Profile` built without
+  `..Default::default()` needs the new field (HARN-33).
+
 ## 0.4.0 (2026-11-26)
 
 - A t3 turn ends on T3 Code's MCP events (`events/stream`): `thread.run_settled` and `thread.needs_input` of its

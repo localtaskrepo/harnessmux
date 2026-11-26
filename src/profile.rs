@@ -144,6 +144,10 @@ pub struct Profile {
     /// t3 only: the branch for that worktree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// t3 only: the linked T3 Code environment the thread runs on, by id or label (`t3 environment list`); none: the
+    /// T3 Code server on this machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
     /// Session title (t3 thread title; ignored by agents without titles).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
