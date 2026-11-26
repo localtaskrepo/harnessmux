@@ -21,7 +21,7 @@
 //! A profile's `environment` runs the thread on a linked T3 Code environment ([`environment`]): every MCP call names it
 //! (`environmentId`), and as T3's CLI and MCP events reach only this machine's server, the first turn is
 //! `t3_thread_launch`, the thread is read with `t3_thread_read` ([`show`]) and a turn follows it by reading it every
-//! [`POLL`].
+//! [`POLL`]; a read T3 refuses waits for the environment only on `orchestration_error` ([`Shown`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -32,7 +32,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
-use super::t3_mcp::{Cli, Environment, Events, Mcp, Signal};
+use super::t3_mcp::{CallFailure, Cli, Environment, Events, Mcp, Signal};
 use super::{Command, Report, Reporter, Start, refuse};
 use crate::agents::AgentSpec;
 use crate::error::{Error, Result};
@@ -47,8 +47,6 @@ const READ_ATTEMPTS: u32 = 3;
 const SERVER_WAIT: Duration = Duration::from_secs(60 * 60);
 /// What T3's CLI prints when its server doesn't answer.
 const UNREACHABLE: &str = "Could not reach the T3 Code server";
-/// What T3 Code says of a thread it doesn't have.
-const GONE: &str = "is no longer available";
 /// The thread's MCP events that end a turn: its run settled, or it waits for an answer.
 const MILESTONES: [&str; 2] = ["thread.run_settled", "thread.needs_input"];
 /// How long a turn waits for T3 Code to start its event subscriptions before it follows the run by polling.
@@ -385,6 +383,10 @@ async fn follow_run(
                         reporter.event(Some(turn), Failure::new(format!("the {} didn't answer for {} minutes; the thread {thread} may still run", server(cli), SERVER_WAIT.as_secs() / 60), FailureKind::Transport).into(), None);
                         return true;
                     }
+                }
+                Shown::Refused(message) => {
+                    reporter.event(Some(turn), EventBody::failed(format!("T3 Code refused to read the thread {thread}: {message}")), None);
+                    return true;
                 }
                 Shown::Unreadable => {
                     failed_reads += 1;
@@ -725,23 +727,28 @@ async fn still_going(mcp: &mut Option<Mcp>, cli: &Cli, thread: &str, error_text:
         || match show(mcp, cli, thread).await {
             Shown::Thread(shown) => RunState::of(&shown).running,
             Shown::Unreachable => true,
-            Shown::Unreadable => false,
+            Shown::Unreadable | Shown::Refused(_) => false,
         }
 }
 
 /// A `t3 thread show --json` read.
 enum Shown {
     Thread(Value),
-    /// The T3 Code server didn't answer.
+    /// The T3 Code server didn't answer; on a linked environment also the relay or the environment
+    /// (`orchestration_error`).
     Unreachable,
+    /// Not read, or the thread is gone (`thread_not_found`).
     Unreadable,
+    /// T3 Code refused the read for another reason (`capability_denied`, `invalid_request`, …), with its message;
+    /// waiting doesn't change that.
+    Refused(String),
 }
 
 impl Shown {
     fn thread(self) -> Option<Value> {
         match self {
             Self::Thread(shown) => Some(shown),
-            Self::Unreachable | Self::Unreadable => None,
+            Self::Unreachable | Self::Unreadable | Self::Refused(_) => None,
         }
     }
 }
@@ -750,11 +757,13 @@ impl Shown {
 async fn show(mcp: &mut Option<Mcp>, cli: &Cli, thread: &str) -> Shown {
     if cli.environment.is_some() {
         let arguments = json!({"threadId": thread, "view": "messages", "limit": 20, "maxCharsPerItem": 20_000, "beforePosition": NEWEST});
-        return match call(mcp, cli, "t3_thread_read", arguments).await {
+        return match try_call(mcp, cli, "t3_thread_read", arguments).await {
             Ok(read) => shown_of(&read).map_or(Shown::Unreadable, Shown::Thread),
-            // A thread that is gone; any other failure is the relay or the environment not answering.
-            Err(error) if error.to_string().contains(GONE) => Shown::Unreadable,
-            Err(_) => Shown::Unreachable,
+            Err(CallFailure::Refused { code: Some(code), .. }) if code == "thread_not_found" => Shown::Unreadable,
+            // The relay or the environment doesn't answer, as does a call that doesn't get through.
+            Err(CallFailure::Refused { code: Some(code), .. }) if code == "orchestration_error" => Shown::Unreachable,
+            Err(CallFailure::Failed(_)) => Shown::Unreachable,
+            Err(CallFailure::Refused { message, .. }) => Shown::Refused(message),
         };
     }
     let Ok(output) = tokio::process::Command::new(&cli.program)
@@ -1333,13 +1342,21 @@ fn reader(cli: &Cli) -> &'static str {
 }
 
 /// Calls a T3 Code MCP tool, signing in on the first call; on the session's linked environment, if it has one.
-async fn call(mcp: &mut Option<Mcp>, cli: &Cli, tool: &str, mut arguments: Value) -> Result<Value> {
+async fn call(mcp: &mut Option<Mcp>, cli: &Cli, tool: &str, arguments: Value) -> Result<Value> {
+    try_call(mcp, cli, tool, arguments).await.map_err(|failure| match failure {
+        CallFailure::Refused { message, .. } => Error::Agent(format!("T3 Code refused {tool}: {message}")),
+        CallFailure::Failed(error) => error,
+    })
+}
+
+/// [`call`], telling apart a call T3 Code refused from one that didn't get through.
+async fn try_call(mcp: &mut Option<Mcp>, cli: &Cli, tool: &str, mut arguments: Value) -> std::result::Result<Value, CallFailure> {
     if let Some(environment) = &cli.environment {
         arguments["environmentId"] = json!(environment.id);
     }
     let connected = match mcp {
         Some(connected) => connected,
-        None => mcp.insert(Mcp::connect(cli).await?),
+        None => mcp.insert(Mcp::connect(cli).await.map_err(CallFailure::Failed)?),
     };
     connected.call(cli, tool, arguments).await
 }
@@ -1490,8 +1507,12 @@ pub async fn settle(spec: &AgentSpec, record: &crate::registry::SessionRecord) -
     let start = Start { spec: spec.clone(), record: record.clone(), resume: true, interrupted: false };
     let cli = cli_of(&start, &program, &args).await?;
     let mut mcp = None;
-    let Shown::Thread(shown) = show(&mut mcp, &cli, &thread).await else {
-        return Err(Error::Agent(format!("could not read the T3 Code thread {thread} with {}; not settled", reader(&cli))));
+    let shown = match show(&mut mcp, &cli, &thread).await {
+        Shown::Thread(shown) => shown,
+        Shown::Refused(message) => return Err(Error::Agent(format!("T3 Code refused to read the thread {thread}: {message}; not settled"))),
+        Shown::Unreachable | Shown::Unreadable => {
+            return Err(Error::Agent(format!("could not read the T3 Code thread {thread} with {}; not settled", reader(&cli))));
+        }
     };
     let state = RunState::of(&shown);
     let link = link(&shown).unwrap_or_else(|| thread.clone());

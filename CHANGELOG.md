@@ -7,6 +7,10 @@
   follow the run by polling, as T3's CLI and events reach only the local server. An unknown or unreachable
   environment, or one without the session's project, fails the start. A `Profile` built without
   `..Default::default()` needs the new field (HARN-33).
+- A remote thread read is judged by T3 Code's failure code, not its message: `thread_not_found` is a gone thread,
+  `orchestration_error` and a read that doesn't get through wait for the environment, and any other refusal
+  (`capability_denied`, `invalid_request`, …) fails the turn right away with T3's message instead of waiting an hour.
+  Every refused MCP call now names T3's message, not its JSON (HARN-34).
 
 ## 0.4.0 (2026-11-26)
 

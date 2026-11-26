@@ -111,27 +111,27 @@ impl Mcp {
     }
 
     /// Calls a T3 Code tool and returns its structured result. A refused token signs in again once.
-    pub async fn call(&mut self, cli: &Cli, tool: &str, arguments: Value) -> Result<Value> {
+    pub async fn call(&mut self, cli: &Cli, tool: &str, arguments: Value) -> std::result::Result<Value, CallFailure> {
         let params = json!({"name": tool, "arguments": arguments});
         let reply = match self.rpc("tools/call", params.clone()).await {
             Err(Failure::Unauthorized) => {
-                *self = Self::sign_in(cli, self.origin.clone()).await?;
+                *self = Self::sign_in(cli, self.origin.clone()).await.map_err(CallFailure::Failed)?;
                 self.rpc("tools/call", params).await
             }
             other => other,
         };
         let reply = match reply {
             Ok(reply) => reply,
-            Err(Failure::Unauthorized) => return Err(Error::Agent(format!("T3 Code refused harnessmux's new sign-in for {tool}"))),
-            Err(Failure::Other(error)) => return Err(error),
+            Err(Failure::Unauthorized) => return Err(CallFailure::Failed(Error::Agent(format!("T3 Code refused harnessmux's new sign-in for {tool}")))),
+            Err(Failure::Other(error)) => return Err(CallFailure::Failed(error)),
         };
         if let Some(error) = reply.get("error") {
-            let message = error.get("message").and_then(Value::as_str).unwrap_or("no message");
-            return Err(Error::Agent(format!("T3 Code refused {tool}: {message}")));
+            let message = error.get("message").and_then(Value::as_str).unwrap_or("no message").to_string();
+            return Err(CallFailure::Refused { code: None, message });
         }
         let result = reply.get("result").cloned().unwrap_or(Value::Null);
         if result.get("isError").and_then(Value::as_bool) == Some(true) {
-            return Err(Error::Agent(format!("T3 Code refused {tool}: {}", tool_text(&result))));
+            return Err(tool_failure(&tool_text(&result)));
         }
         Ok(match result.get("structuredContent") {
             Some(content) => content.clone(),
@@ -213,6 +213,25 @@ impl Mcp {
             self.session = Some(session.to_string());
         }
         Ok(response)
+    }
+}
+
+/// Why a tool call failed.
+pub enum CallFailure {
+    /// T3 Code refused the call: its `OrchestratorMcpFailure` code when it names one (`thread_not_found`,
+    /// `capability_denied`, `orchestration_error`, …), and its message.
+    Refused { code: Option<String>, message: String },
+    /// The call didn't get through: no sign-in, the server didn't answer or answered something other than JSON-RPC.
+    Failed(Error),
+}
+
+/// A tool error's text as T3 Code sends it: `{"_tag":"OrchestratorMcpFailure","code":…,"message":…}`, else plain text.
+fn tool_failure(text: &str) -> CallFailure {
+    let failure = serde_json::from_str::<Value>(text).ok();
+    let field = |name: &str| failure.as_ref().and_then(|failure| failure.get(name)).and_then(Value::as_str).map(str::to_string);
+    match (field("code"), field("message")) {
+        (Some(code), Some(message)) => CallFailure::Refused { code: Some(code), message },
+        _ => CallFailure::Refused { code: None, message: text.to_string() },
     }
 }
 

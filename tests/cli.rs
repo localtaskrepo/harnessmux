@@ -526,7 +526,8 @@ fn base64url(bytes: &[u8]) -> String {
 /// page read on, also those in `activity-more.json`; a page read after the number in `read-fail-after` fails) as T3 Code does for a client outside a thread: the oldest `limit` without a position, the newest `limit` before
 /// `beforePosition`, the oldest `limit` after `afterPosition`, an item's text from `textOffset` with `itemId`; texts are
 /// cut at `maxCharsPerItem`. View `messages` returns the thread and messages of `show.json` (a thread that is gone once
-/// `gone` exists). Each
+/// `gone` exists; refused with the code in `read-refused`, `<code> [<times>]`, for that many reads or until it is
+/// removed). Each
 /// sign-in step and tool call is appended to `calls` (`oauth token`, `mcp <tool> <arguments>`). Once `revoke` exists,
 /// the next `/mcp` request finds every token revoked (and removes the file). Returns the origin.
 #[cfg(unix)]
@@ -649,8 +650,22 @@ fn fake_t3_server(dir: &Path, project: &Path) -> String {
                                 Err("Thread read failed".to_string())
                             }
                             "t3_thread_read" if arguments["view"] == "messages" => {
+                                // T3 Code's refusal: `{"_tag":"OrchestratorMcpFailure","code":…,"message":…}`.
+                                let refuse = |code: &str, message: String| {
+                                    Err(serde_json::json!({"_tag": "OrchestratorMcpFailure", "code": code, "message": message}).to_string())
+                                };
+                                let refused = std::fs::read_to_string(dir.join("read-refused")).ok();
                                 if dir.join("gone").exists() {
-                                    Err(format!("Thread {} is no longer available.", arguments["threadId"].as_str().unwrap()))
+                                    refuse("thread_not_found", format!("Thread {} is no longer available.", arguments["threadId"].as_str().unwrap()))
+                                } else if let Some(refused) = refused {
+                                    let mut words = refused.split_whitespace();
+                                    let code = words.next().unwrap().to_string();
+                                    match words.next().map(|times| times.parse::<u32>().unwrap()) {
+                                        Some(1) => std::fs::remove_file(dir.join("read-refused")).unwrap(),
+                                        Some(times) => std::fs::write(dir.join("read-refused"), format!("{code} {}", times - 1)).unwrap(),
+                                        None => {}
+                                    }
+                                    refuse(&code, format!("Refused with {code}."))
                                 } else {
                                     let show: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("show.json")).unwrap()).unwrap();
                                     let kind = |role: &Value| if role == "user" { "user_message" } else { "assistant_message" };
@@ -1800,6 +1815,46 @@ fn a_t3_session_on_an_unknown_unreachable_or_projectless_environment_doesnt_star
     assert!(mcp_calls(&dir, "t3_thread_launch").is_empty());
     let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
     assert!(!calls.contains("thread start") && !calls.contains("thread show"), "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_t3_turn_on_a_linked_environment_that_t3_refuses_to_read_fails_right_away_with_its_message() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    linked(&dir, "reachable");
+    show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r2","text":"Done."}]"#);
+    for code in ["capability_denied", "invalid_request"] {
+        std::fs::write(dir.join("read-refused"), code).unwrap();
+        let name = &code[..1];
+        let run = home.run(&["run", "t3", "--name", name, "--environment", "dyson", "--provider", "claudeAgent", "--model", "m", "Fix it"]);
+        assert!(!run.status.success(), "{}", text(&run));
+        let events = home.events(name);
+        let failed = events.iter().find(|e| e["type"] == "turn.failed").unwrap();
+        assert!(
+            failed["error"].as_str().unwrap().contains(&format!(": Refused with {code}."))
+                && failed["error"].as_str().unwrap().starts_with("T3 Code refused to read the thread t"),
+            "{failed}"
+        );
+        assert!(!events.iter().any(|e| e["type"] == "notice" && e["text"].as_str().unwrap().contains("doesn't answer")), "{events:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_t3_turn_on_a_linked_environment_waits_for_it_through_orchestration_errors() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    linked(&dir, "reachable");
+    show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r2","text":"Done."}]"#);
+    // More refused reads than a gone thread is read before the turn fails.
+    std::fs::write(dir.join("read-refused"), "orchestration_error 4").unwrap();
+    let run = home.run(&["run", "t3", "--name", "o", "--environment", "dyson", "--provider", "claudeAgent", "--model", "m", "Fix it"]);
+    assert!(run.status.success(), "{}", text(&run));
+    let events = home.events("o");
+    assert!(events.iter().any(|e| e["type"] == "notice" && e["text"].as_str().unwrap().contains("The T3 Code environment dyson doesn't answer")), "{events:?}");
+    assert!(events.iter().any(|e| e["type"] == "message" && e["text"] == "Done."), "{events:?}");
+    assert!(!events.iter().any(|e| e["type"] == "turn.failed"), "{events:?}");
 }
 
 #[cfg(unix)]
