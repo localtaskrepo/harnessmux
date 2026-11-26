@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.0 (2026-11-26)
+
+- A t3 turn ends on T3 Code's MCP events (`events/stream`): `thread.run_settled` and `thread.needs_input` of its
+  thread, subscribed before the send (for the project before a launch), each sent as the new `milestone` event. A
+  milestone wins over a `t3 thread show` still behind it; `thread show` still feeds the replies and tool calls. When
+  the events can't be read, the turn polls `t3 thread show` as before and a notice says so once per session (lotar
+  DEV-877).
+- A profile's `output_schema` (`run --output-schema <file>`, t3 only) asks T3 Code for a typed result
+  (`t3_submit_output`); a completed turn sends it as the new `turn.output` event before `turn.finished`, or a notice
+  when the run submitted none. A library match on `EventBody` without `_` needs the two new variants, and a `Profile`
+  built without `..Default::default()` the new field (lotar DEV-877).
+
 ## 0.3.1 (2026-11-25)
 
 - A t3 turn that fails on a usage limit reports `resets_at` from T3 Code's own usage-limit notice: the Unix time its

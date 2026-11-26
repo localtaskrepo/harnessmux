@@ -211,6 +211,25 @@ pub enum EventBody {
     /// Something the caller should know that is not an error: an option the agent doesn't offer, a queued prompt.
     #[serde(rename = "notice")]
     Notice { text: String },
+    /// The turn's result, as the profile's `output_schema` asked for (t3: what the agent submitted with
+    /// `t3_submit_output`). Comes before `turn.finished`.
+    #[serde(rename = "turn.output")]
+    Output { output: serde_json::Value },
+    /// A milestone of the agent's own session (t3: T3 Code's MCP events): `thread.run_settled` with the run and its
+    /// outcome (completed, failed, interrupted, cancelled), `thread.needs_input` with the request and its kind
+    /// (user_input, approval).
+    #[serde(rename = "milestone")]
+    Milestone {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+    },
     #[serde(rename = "turn.finished")]
     TurnFinished {
         stop_reason: StopReason,

@@ -147,6 +147,10 @@ pub struct Profile {
     /// Session title (t3 thread title; ignored by agents without titles).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// t3 only: a JSON Schema the turn's result must match. T3 Code has the agent submit it (`t3_submit_output`); the
+    /// result comes as a `turn.output` event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<serde_json::Value>,
 }
 
 impl Profile {

@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Digest as _;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::sync::mpsc;
 
 use crate::error::{Error, Result};
 use crate::paths;
@@ -26,6 +27,10 @@ const CLIENT_NAME: &str = "harnessmux";
 /// T3 Code sends the authorization code here; nothing listens, the code is read from the decision's answer.
 const REDIRECT: &str = "http://127.0.0.1/callback";
 const PROTOCOL: &str = "2025-06-18";
+/// The stateless MCP revision T3 Code serves events on (SEP-3415): no session, the version in headers and `_meta`.
+const EVENTS_PROTOCOL: &str = "2026-07-28";
+/// How often T3 Code sends a heartbeat on an event stream; a stream silent for three of them has dropped.
+const HEARTBEAT: Duration = Duration::from_secs(15);
 /// A request T3 Code doesn't answer in this time fails.
 const TIMEOUT: Duration = Duration::from_secs(120);
 /// A token this close to its end signs in again.
@@ -124,6 +129,34 @@ impl Mcp {
         })
     }
 
+    /// Subscribes to T3 Code's MCP events `names` (SEP-3415 `events/stream`) with `arguments` (`threadIds`,
+    /// `projectIds`), from now on.
+    pub fn events(&self, names: &[&str], arguments: &Value) -> Events {
+        let (sender, signals) = mpsc::unbounded_channel();
+        let tasks = names
+            .iter()
+            .map(|name| {
+                let (origin, token, name, arguments, sender) =
+                    (self.origin.clone(), self.token.clone(), (*name).to_string(), arguments.clone(), sender.clone());
+                tokio::spawn(async move {
+                    let signal = match stream_events(&origin, &token, &name, &arguments, &sender).await {
+                        Ok(()) => Signal::Ended(format!("{name}: T3 Code ended the stream")),
+                        Err(None) => Signal::Refused,
+                        Err(Some(why)) => Signal::Ended(format!("{name}: {why}")),
+                    };
+                    let _ = sender.send(signal);
+                })
+            })
+            .collect();
+        Events { tasks, signals }
+    }
+
+    /// Signs in again, after T3 Code refused the token ([`Signal::Refused`]).
+    pub async fn renew(&mut self, cli: &Cli) -> Result<()> {
+        *self = Self::sign_in(cli, self.origin.clone()).await?;
+        Ok(())
+    }
+
     async fn initialize(&mut self) -> std::result::Result<(), Failure> {
         let params = json!({"protocolVersion": PROTOCOL, "capabilities": {}, "clientInfo": {"name": CLIENT_NAME, "version": env!("CARGO_PKG_VERSION")}});
         let reply = self.rpc("initialize", params).await?;
@@ -170,6 +203,175 @@ impl Mcp {
             self.session = Some(session.to_string());
         }
         Ok(response)
+    }
+}
+
+/// What an event stream sends.
+#[derive(Debug)]
+pub enum Signal {
+    /// A subscription is active: events from here on come.
+    Active,
+    Event {
+        name: String,
+        data: Value,
+    },
+    /// A subscription ended, with the reason; no more events come from it.
+    Ended(String),
+    /// T3 Code refused the token for a subscription ([`Mcp::renew`]).
+    Refused,
+}
+
+/// Running event subscriptions; dropping it ends them.
+pub struct Events {
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    pub signals: mpsc::UnboundedReceiver<Signal>,
+}
+
+impl Drop for Events {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+/// One `events/stream` subscription to `name`, sending its events until it ends; `Err` with the reason it ended, none
+/// when T3 Code refused the token.
+async fn stream_events(
+    origin: &str,
+    token: &str,
+    name: &str,
+    arguments: &Value,
+    sender: &mpsc::UnboundedSender<Signal>,
+) -> std::result::Result<(), Option<String>> {
+    let (host, address) = address(origin).map_err(|error| Some(error.to_string()))?;
+    let meta = json!({"io.modelcontextprotocol/protocolVersion": EVENTS_PROTOCOL, "io.modelcontextprotocol/clientCapabilities": {}});
+    let params = json!({"name": name, "arguments": arguments, "cursor": null, "heartbeatMs": HEARTBEAT.as_millis() as u64, "_meta": meta});
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "events/stream", "params": params}).to_string();
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nhost: {host}\r\ncontent-type: application/json\r\ncontent-length: {}\r\naccept: application/json, text/event-stream\r\nauthorization: Bearer {token}\r\nmcp-protocol-version: {EVENTS_PROTOCOL}\r\nmcp-method: events/stream\r\nmcp-name: {name}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let silence = HEARTBEAT * 3;
+    let mut stream = match tokio::time::timeout(TIMEOUT, tokio::net::TcpStream::connect(&address)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) => return Err(Some(format!("could not reach the T3 Code server: {error}"))),
+        Err(_) => return Err(Some("could not reach the T3 Code server".into())),
+    };
+    stream.write_all(request.as_bytes()).await.map_err(|error| Some(error.to_string()))?;
+    let mut raw = Vec::new();
+    let mut body = Body::default();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = match tokio::time::timeout(silence, stream.read(&mut buffer)).await {
+            Ok(Ok(read)) => read,
+            Ok(Err(error)) => return Err(Some(error.to_string())),
+            Err(_) => return Err(Some(format!("no heartbeat in {} seconds", silence.as_secs()))),
+        };
+        raw.extend_from_slice(&buffer[..read]);
+        if !body.started {
+            let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+                if read == 0 {
+                    return Err(Some("T3 Code's answer is not HTTP".into()));
+                }
+                continue;
+            };
+            let head = parse_head(&raw[..split]).ok_or_else(|| Some("T3 Code's answer is not HTTP".to_string()))?;
+            raw.drain(..split + 4);
+            if !head.header("content-type").is_some_and(|ct| ct.starts_with("text/event-stream")) || head.status != 200 {
+                // An error answer: the rest of it, for its message.
+                let mut rest = raw.clone();
+                let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut rest)).await;
+                return Err((head.status != 401).then(|| refusal(&head, &rest)));
+            }
+            body.chunked = head.header("transfer-encoding").is_some_and(|value| value.eq_ignore_ascii_case("chunked"));
+            body.started = true;
+        }
+        body.take(&mut raw);
+        while let Some(event) = body.next_event() {
+            let Some(message) = sse_data(&event).and_then(|data| serde_json::from_str::<Value>(&data).ok()) else { continue };
+            let params = message.get("params").cloned().unwrap_or(Value::Null);
+            match message.get("method").and_then(Value::as_str) {
+                Some("notifications/events/active") => {
+                    let _ = sender.send(Signal::Active);
+                }
+                Some("notifications/events/event") => {
+                    let name = params.get("name").and_then(Value::as_str).unwrap_or(name).to_string();
+                    let _ = sender.send(Signal::Event { name, data: params.get("data").cloned().unwrap_or(Value::Null) });
+                }
+                Some("notifications/events/error" | "notifications/events/terminated") => return Err(Some(reason_of(&params))),
+                Some(_) => {}
+                None if message.get("error").is_some() => return Err(Some(reason_of(&message))),
+                None => {}
+            }
+        }
+        if read == 0 {
+            return Ok(());
+        }
+    }
+}
+
+/// Why T3 Code refused a subscription: its JSON-RPC error message, else the status.
+fn refusal(head: &Response, rest: &[u8]) -> String {
+    let chunked = head.header("transfer-encoding").is_some_and(|value| value.eq_ignore_ascii_case("chunked"));
+    let body = if chunked { dechunk(rest).unwrap_or_else(|| rest.to_vec()) } else { rest.to_vec() };
+    let text = String::from_utf8_lossy(&body);
+    let parsed =
+        serde_json::from_str::<Value>(text.trim()).ok().or_else(|| text.split("\n\n").filter_map(sse_data).find_map(|data| serde_json::from_str(&data).ok()));
+    match parsed {
+        Some(message) if message.get("error").is_some() => reason_of(&message),
+        _ => format!("T3 Code answered {}: {}", head.status, excerpt(&text)),
+    }
+}
+
+/// The message of an error or termination.
+fn reason_of(value: &Value) -> String {
+    let error = value.get("error").unwrap_or(value);
+    error.get("message").and_then(Value::as_str).map_or_else(|| format!("T3 Code ended the stream: {error}"), str::to_string)
+}
+
+/// An event stream's body as it arrives: chunked transfer decoded, cut into server-sent events.
+#[derive(Default)]
+struct Body {
+    /// The answer's head has been read.
+    started: bool,
+    chunked: bool,
+    text: Vec<u8>,
+}
+
+impl Body {
+    /// Moves what `raw` holds of the body into `text`, keeping a chunk not yet whole in `raw`.
+    fn take(&mut self, raw: &mut Vec<u8>) {
+        if !self.chunked {
+            self.text.append(raw);
+            return;
+        }
+        loop {
+            let Some(end) = raw.windows(2).position(|w| w == b"\r\n") else { return };
+            let Some(size) = std::str::from_utf8(&raw[..end]).ok().and_then(|line| usize::from_str_radix(line.split(';').next()?.trim(), 16).ok()) else {
+                return;
+            };
+            if size == 0 || raw.len() < end + 2 + size + 2 {
+                return;
+            }
+            self.text.extend_from_slice(&raw[end + 2..end + 2 + size]);
+            raw.drain(..end + 2 + size + 2);
+        }
+    }
+
+    /// The next whole server-sent event.
+    fn next_event(&mut self) -> Option<String> {
+        let (end, gap) = self
+            .text
+            .windows(2)
+            .position(|w| w == b"\n\n")
+            .map(|at| (at, 2))
+            .into_iter()
+            .chain(self.text.windows(4).position(|w| w == b"\r\n\r\n").map(|at| (at, 4)))
+            .min()?;
+        let event = String::from_utf8_lossy(&self.text[..end]).replace('\r', "");
+        self.text.drain(..end + gap);
+        Some(event)
     }
 }
 
@@ -414,10 +616,7 @@ impl Response {
 /// One HTTP/1.1 POST to the T3 Code server, which listens on plain HTTP on this machine.
 async fn post(origin: &str, path: &str, content_type: &str, body: &[u8], headers: &[(&str, &str)]) -> Result<Response> {
     let unreachable = |why: String| Error::Agent(format!("Could not reach the T3 Code server at {origin}: {why}"));
-    let host = origin
-        .strip_prefix("http://")
-        .ok_or_else(|| Error::Agent(format!("the T3 Code server's origin {origin} is not http://; harnessmux talks to it on this machine only")))?;
-    let address = if host.contains(':') { host.to_string() } else { format!("{host}:80") };
+    let (host, address) = address(origin)?;
     let exchange = async {
         let mut stream = tokio::net::TcpStream::connect(&address).await?;
         let mut request =
@@ -440,18 +639,32 @@ async fn post(origin: &str, path: &str, content_type: &str, body: &[u8], headers
     parse_response(&raw).ok_or_else(|| unreachable("its answer is not HTTP".into()))
 }
 
+/// The host header and the socket address of an `http://` origin.
+fn address(origin: &str) -> Result<(&str, String)> {
+    let host = origin
+        .strip_prefix("http://")
+        .ok_or_else(|| Error::Agent(format!("the T3 Code server's origin {origin} is not http://; harnessmux talks to it on this machine only")))?;
+    Ok((host, if host.contains(':') { host.to_string() } else { format!("{host}:80") }))
+}
+
 fn parse_response(raw: &[u8]) -> Option<Response> {
     let split = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
-    let head = std::str::from_utf8(&raw[..split]).ok()?;
-    let mut lines = head.split("\r\n");
-    let status = lines.next()?.split_whitespace().nth(1)?.parse().ok()?;
-    let headers: Vec<(String, String)> =
-        lines.filter_map(|line| line.split_once(':')).map(|(key, value)| (key.trim().to_ascii_lowercase(), value.trim().to_string())).collect();
+    let mut response = parse_head(&raw[..split])?;
     let mut body = raw[split + 4..].to_vec();
-    if headers.iter().any(|(key, value)| key == "transfer-encoding" && value.eq_ignore_ascii_case("chunked")) {
+    if response.header("transfer-encoding").is_some_and(|value| value.eq_ignore_ascii_case("chunked")) {
         body = dechunk(&body)?;
     }
-    Some(Response { status, headers, body: String::from_utf8_lossy(&body).into_owned() })
+    response.body = String::from_utf8_lossy(&body).into_owned();
+    Some(response)
+}
+
+/// The status line and headers, before the blank line; no body.
+fn parse_head(head: &[u8]) -> Option<Response> {
+    let head = std::str::from_utf8(head).ok()?;
+    let mut lines = head.split("\r\n");
+    let status = lines.next()?.split_whitespace().nth(1)?.parse().ok()?;
+    let headers = lines.filter_map(|line| line.split_once(':')).map(|(key, value)| (key.trim().to_ascii_lowercase(), value.trim().to_string())).collect();
+    Some(Response { status, headers, body: String::new() })
 }
 
 fn dechunk(mut raw: &[u8]) -> Option<Vec<u8>> {
@@ -502,5 +715,21 @@ mod tests {
         let chunked = parse_response(b"HTTP/1.1 401 Unauthorized\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2;x=y\r\nde\r\n0\r\n\r\n").unwrap();
         assert_eq!((chunked.status, chunked.body.as_str()), (401, "abcde"));
         assert_eq!(sse_data("event: message\ndata: {\"id\":1}").as_deref(), Some("{\"id\":1}"));
+    }
+
+    #[test]
+    fn event_streams_decode_as_their_chunks_arrive() {
+        let mut body = Body { started: true, chunked: true, text: Vec::new() };
+        let mut raw = b"f\r\ndata: {\"a\":".to_vec();
+        body.take(&mut raw);
+        assert!(body.next_event().is_none(), "a chunk not yet whole stays out");
+        raw.extend_from_slice(b"1}\n\n\r\n7\r\ndata: \xc3\r\n");
+        body.take(&mut raw);
+        assert_eq!(body.next_event().as_deref(), Some("data: {\"a\":1}"));
+        assert!(body.next_event().is_none());
+        raw.extend_from_slice(b"3\r\n\xa4\n\n\r\n");
+        body.take(&mut raw);
+        assert_eq!(body.next_event().as_deref(), Some("data: \u{e4}"), "a character split by chunks comes whole");
+        assert!(raw.is_empty() && body.next_event().is_none());
     }
 }

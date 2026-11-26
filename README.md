@@ -129,7 +129,7 @@ command = ["my-agent", "--acp"]
 | claude | `claude-agent-acp` 0.107.0 | run live: new, send, resume after the owner was killed, cancel |
 | codex | `codex-acp` 2.6.0 | run live: new, send, effort |
 | copilot | `copilot --acp --stdio` (1.0.111) | run live: one turn, a model error reported as `turn.failed` |
-| t3 | `t3 thread start/show` and T3 Code's MCP server (T3 Code 0.1.10; the activity 0.1.11) | run live: new thread, a thread in an existing worktree, a later turn, a repeated launch and send, settle, tool calls from the activity |
+| t3 | `t3 thread start/show` and T3 Code's MCP server (T3 Code 0.1.10; the activity 0.1.11; events and results 0.1.12) | run live: new thread, a thread in an existing worktree, a later turn, a repeated launch and send, settle, tool calls from the activity, milestones and an output schema |
 | gemini | `gemini --acp` | from its docs, not run live |
 | cursor | `cursor-agent acp` | from its docs, not run live |
 | droid | `droid exec --output-format acp` | from its docs, not run live |
@@ -182,6 +182,24 @@ send nothing, nor do the items of other threads. When the activity
 can't be read, a notice says so and the rest of the turn streams the replies from `t3 thread show`. T3 Code shows no
 token usage, so a t3 turn sends no `usage`.
 
+A t3 turn ends on the thread's milestones, T3 Code's MCP events (`events/stream`, MCP revision 2026-07-28):
+`thread.run_settled` (`completed` ends it, `failed`, `interrupted` and `cancelled` fail it with the run's errors) and
+`thread.needs_input` (it ends waiting for an answer). harnessmux subscribes before it sends, for the thread, or for
+the project before `t3_thread_launch` makes the thread, so a run that ends at once is seen; each milestone of the
+thread is a `milestone` event. `t3 thread show` still feeds the replies and tool calls but no longer ends the turn: a
+milestone wins over a `thread show` that still shows the same run running, while a newer run or one T3 Code resumes on
+its own (background tasks) keeps the turn following. A turn that follows a run it didn't send (after the owner died,
+or a `t3` that exited while the thread goes on) ends on either. When the events can't be read (a T3 Code without
+them, a refused sign-in, a stream that fails or drops), the turn follows the run by reading `t3 thread show` every 2
+seconds as before, and a notice says so once per session; each turn tries the events again. The first turn of a
+thread `t3 thread start` makes ends when that command does.
+
+`--output-schema <file>` (profile `output_schema`) gives T3 Code a JSON Schema the turn's result must match
+(`outputSchema`, `t3 thread start --output-schema`): T3 Code tells the agent to submit it with `t3_submit_output` and
+asks again in a continuation run when a run completes without it. After a completed run harnessmux waits for the
+result with `t3_thread_wait` (`untilOutput`, up to 10 minutes) and sends it as `turn.output` after the turn's
+`message`; no result, or one that can't be read, is a notice and the turn ends as it would without a schema.
+
 ## Events
 
 One JSON object per line. Every event has `v` (format version, 1), `ts`, `session`, `project`, `seq` and, inside a
@@ -202,6 +220,8 @@ turn, `turn`; `raw` keeps the agent's own message it came from.
 | `usage` | `context_used`, `context_size`, `cost_usd`, `rate_limit` (`status`: allowed, allowed_warning, rejected; `window`, `resets_at`, `utilization`; claude only) |
 | `config.changed` | `option`, `value` |
 | `notice` | `text` |
+| `milestone` | `name` and what the agent's own session says of it; t3: `thread.run_settled` with `run`, `outcome` (completed, failed, interrupted, cancelled), `thread.needs_input` with `request`, `kind` (user_input, approval); `raw` is T3 Code's event |
+| `turn.output` | `output`: the result the profile's `output_schema` asked for (t3 only), before `turn.finished` |
 | `turn.finished` | `stop_reason` (end_turn, max_tokens, max_turn_requests, refusal, cancelled, waiting_for_answer), `usage` |
 | `turn.failed` | `error`, `kind` (rate_limited, quota, auth_required, overloaded, context_exhausted, transport, other), `resets_at`, `retryable`; `raw` holds the agent's JSON-RPC error |
 | `session.ended` | `reason` (closed, idle, or the error) |

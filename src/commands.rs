@@ -78,6 +78,9 @@ pub struct RunArgs {
     /// Session title (t3 thread title).
     #[arg(long)]
     title: Option<String>,
+    /// t3: a JSON Schema file the turn's result must match; the result comes as a turn.output event.
+    #[arg(long, value_name = "FILE")]
+    output_schema: Option<PathBuf>,
     /// Print events as JSON lines.
     #[arg(long)]
     json: bool,
@@ -116,6 +119,11 @@ fn read_prompt(args: &PromptArgs) -> Result<Option<String>> {
     }
 }
 
+fn read_schema(file: &Path) -> Result<serde_json::Value> {
+    let text = std::fs::read_to_string(file).map_err(|error| Error::io(format!("reading {}", file.display()), error))?;
+    serde_json::from_str(&text).map_err(|error| Error::Invalid(format!("--output-schema {}: not JSON: {error}", file.display())))
+}
+
 fn profile(args: &RunArgs) -> Result<Profile> {
     let mut profile = Profile {
         model: args.model.clone(),
@@ -134,6 +142,7 @@ fn profile(args: &RunArgs) -> Result<Profile> {
         worktree_base: args.worktree.clone(),
         branch: args.branch.clone(),
         title: args.title.clone(),
+        output_schema: args.output_schema.as_deref().map(read_schema).transpose()?,
         ..Profile::default()
     };
     for dir in &args.add_dirs {
@@ -529,6 +538,7 @@ impl Printer {
                 }
             }
             EventBody::SessionEnded { reason } => self.note(&format!("session ended: {reason}")),
+            EventBody::Output { output } => self.note(&format!("output: {output}")),
             _ => {}
         }
     }

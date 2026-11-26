@@ -15,6 +15,8 @@
 //! because the T3 Code server doesn't answer, doesn't end the turn: it follows the thread's run, waiting for the server
 //! up to [`SERVER_WAIT`]. The profile's effort and `options` go to T3 as model options (`--option id=value`), which T3
 //! takes only with a provider and model. T3's CLI has no child threads, no permission answers and no interrupt.
+//! A turn ends on the thread's milestones from T3 Code's MCP events ([`Live`], [`follow_run`]), else on `t3 thread show`.
+//! The profile's `output_schema` asks T3 Code for a typed result, read after a completed run ([`read_output`]).
 //! [`settle`] moves a finished thread to T3's Settled group.
 
 use std::collections::HashMap;
@@ -26,12 +28,13 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
-use super::t3_mcp::{Cli, Mcp};
+use super::t3_mcp::{Cli, Events, Mcp, Signal};
 use super::{Command, Report, Reporter, Start, refuse};
 use crate::agents::AgentSpec;
 use crate::error::{Error, Result};
 use crate::event;
 use crate::event::{EventBody, Failure, FailureKind, PlanEntry, StopReason, Usage};
+use crate::paths;
 
 const POLL: Duration = Duration::from_secs(2);
 /// Failed `t3 thread show` reads in a row before following a run gives up.
@@ -40,6 +43,14 @@ const READ_ATTEMPTS: u32 = 3;
 const SERVER_WAIT: Duration = Duration::from_secs(60 * 60);
 /// What T3's CLI prints when its server doesn't answer.
 const UNREACHABLE: &str = "Could not reach the T3 Code server";
+/// The thread's MCP events that end a turn: its run settled, or it waits for an answer.
+const MILESTONES: [&str; 2] = ["thread.run_settled", "thread.needs_input"];
+/// How long a turn waits for T3 Code to start its event subscriptions before it follows the run by polling.
+const EVENTS_WAIT: Duration = Duration::from_secs(5);
+/// How long a completed turn waits for the result its output schema asks for, which a continuation run may submit.
+const OUTPUT_WAIT: Duration = Duration::from_secs(10 * 60);
+/// `t3_thread_wait`'s longest wait per call.
+const WAIT_MS: u64 = 45_000;
 
 pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, reporter: Reporter) -> Result<()> {
     let profile = start.record.profile.clone();
@@ -62,6 +73,7 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
     let (program, base_args) = start.spec.launch_command().await?;
     let cli = cli_of(&start, &program, &base_args);
     let mut mcp = None;
+    let mut live = Live::default();
     reporter.report(Report::Ready);
     let mut thread = start.record.agent_session.clone();
     let mut follow = Follow::default();
@@ -126,17 +138,22 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
             && let Some(id) = &thread
         {
             reporter.notice(Some(turn), "The previous owner stopped during a turn; this turn follows the T3 Code thread's run and doesn't send the prompt");
-            if !follow_run(&mut mcp, &cli, &program, &start, id, turn, None, &mut follow, &mut commands, &reporter).await {
+            if !follow_run(&mut mcp, &cli, &program, &start, id, turn, None, &mut live, &mut follow, &mut commands, &reporter).await {
                 return Ok(());
             }
             continue;
         }
         if let Some(id) = thread.clone() {
-            let arguments = json!({"threadId": id, "message": text, "mode": "auto", "clientRequestId": request_id(&start, &turn.to_string())});
+            let mut arguments = json!({"threadId": id, "message": text, "mode": "auto", "clientRequestId": request_id(&start, &turn.to_string())});
+            if let Some(schema) = &profile.output_schema {
+                arguments["outputSchema"] = schema.clone();
+            }
+            // Open before the send, so a run that ends at once is seen.
+            live.open(&mut mcp, &cli, json!({"threadIds": [id]}), turn, &reporter).await;
             match call(&mut mcp, &cli, "t3_thread_send", arguments).await {
                 Ok(sent) => {
                     let run = sent.get("runId").and_then(Value::as_str);
-                    if !follow_run(&mut mcp, &cli, &program, &start, &id, turn, run, &mut follow, &mut commands, &reporter).await {
+                    if !follow_run(&mut mcp, &cli, &program, &start, &id, turn, run, &mut live, &mut follow, &mut commands, &reporter).await {
                         return Ok(());
                     }
                 }
@@ -147,14 +164,15 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
         // Saved before T3 makes the thread, so an owner that dies before it saves the id leaves a trace.
         note_asked(&reporter, Some(event::now())).await;
         if let Some(worktree) = &worktree {
-            match launch(&mut mcp, &cli, &start, worktree, &text).await {
+            match launch(&mut mcp, &cli, &start, worktree, &text, &mut live, turn, &reporter).await {
                 Ok(launched) => {
                     let id = launched.thread;
                     thread = Some(id.clone());
                     reporter.report(Report::AgentSession { id: id.clone(), adapter: None });
                     follow.link = launched.link;
                     reporter.event(None, started(&start, &id, "new", follow.link.clone()), None);
-                    if !follow_run(&mut mcp, &cli, &program, &start, &id, turn, launched.run.as_deref(), &mut follow, &mut commands, &reporter).await {
+                    if !follow_run(&mut mcp, &cli, &program, &start, &id, turn, launched.run.as_deref(), &mut live, &mut follow, &mut commands, &reporter).await
+                    {
                         return Ok(());
                     }
                 }
@@ -180,6 +198,17 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
                 args.extend(["--branch".into(), branch.clone()]);
             }
         }
+        // Removed when the turn ends.
+        let schema_file = match &profile.output_schema {
+            Some(schema) => {
+                let file = paths::state_dir().join(format!("t3-output-schema-{}-{turn}.json", start.record.name));
+                std::fs::create_dir_all(paths::state_dir()).map_err(|error| Error::io("creating the state directory", error))?;
+                std::fs::write(&file, schema.to_string()).map_err(|error| Error::io(format!("writing {}", file.display()), error))?;
+                args.extend(["--output-schema".into(), file.display().to_string()]);
+                Some(SchemaFile(file))
+            }
+            None => None,
+        };
         args.push("--wait".into());
         let mut child = tokio::process::Command::new(&program)
             .args(&args)
@@ -268,7 +297,7 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
             && still_going(&program, &start, id, &error_text).await
         {
             reporter.notice(Some(turn), format!("t3 exited with {status} while the thread goes on; this turn follows its run: {link}"));
-            if !follow_run(&mut mcp, &cli, &program, &start, id, turn, None, &mut follow, &mut commands, &reporter).await {
+            if !follow_run(&mut mcp, &cli, &program, &start, id, turn, None, &mut live, &mut follow, &mut commands, &reporter).await {
                 return Ok(());
             }
             continue;
@@ -276,9 +305,16 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
         if !reply.is_empty() {
             reporter.event(Some(turn), EventBody::Message { text: reply.clone() }, None);
         }
+        if status.code() == Some(0)
+            && schema_file.is_some()
+            && let Some(id) = &thread
+        {
+            read_output(&mut mcp, &cli, id, None, turn, &reporter).await;
+        }
+        drop(schema_file);
         let body = match status.code() {
             Some(0) => finished(StopReason::EndTurn),
-            Some(2) => waiting(&reporter, turn, &link),
+            Some(2) => waiting_body(&reporter, turn, &link),
             _ => EventBody::failed(format!("t3 exited with {status}: {}", error_text.trim())),
         };
         reporter.event(Some(turn), body, None);
@@ -287,7 +323,9 @@ pub async fn run(start: Start, mut commands: mpsc::UnboundedReceiver<Command>, r
 }
 
 /// Follow the thread's latest run (or `run`, once T3 shows it) to its end as `turn`, without sending a prompt. `false`
-/// when the session closes.
+/// when the session closes. With the thread's milestones ([`Live`]) the turn ends on their event, as `t3 thread show`
+/// may be behind; without them, or when following a run it didn't send (`run` none, which may have ended before the
+/// milestones were open), also on `t3 thread show`.
 #[expect(clippy::too_many_arguments, reason = "the run loop's state, passed down")]
 async fn follow_run(
     mcp: &mut Option<Mcp>,
@@ -297,16 +335,23 @@ async fn follow_run(
     thread: &str,
     turn: u64,
     run: Option<&str>,
+    live: &mut Live,
     follow: &mut Follow,
     commands: &mut mpsc::UnboundedReceiver<Command>,
     reporter: &Reporter,
 ) -> bool {
+    if live.events.is_none() && run.is_none() {
+        live.open(mcp, cli, json!({"threadIds": [thread]}), turn, reporter).await;
+    }
+    let mut events = live.events.take();
     let mut poll = tokio::time::interval(POLL);
     let mut failed_reads = 0;
     let mut unreachable_since: Option<Instant> = None;
     // Once T3 shows `run`, a later run is its resumption (after a background task) and is followed too.
     let mut current = run.is_none();
-    let shown = loop {
+    // The milestone that ends the turn, kept until `t3 thread show` can be read for the run's reply.
+    let mut ended: Option<Milestone> = None;
+    let (shown, milestone) = loop {
         tokio::select! {
             _ = poll.tick() => match show(program, start, thread).await {
                 Shown::Thread(shown) => {
@@ -315,8 +360,11 @@ async fn follow_run(
                     let state = RunState::of(&shown);
                     current = current || state.run.as_deref() == run;
                     stream(mcp, cli, thread, &shown, current, follow, turn, reporter).await;
-                    if current && (!state.running || state.waiting) {
-                        break shown;
+                    if ended.is_some() {
+                        break (Some(shown), ended.take());
+                    }
+                    if current && (!state.running || state.waiting) && (events.is_none() || run.is_none()) {
+                        break (Some(shown), None);
                     }
                 }
                 Shown::Unreachable => {
@@ -338,6 +386,45 @@ async fn follow_run(
                     }
                 }
             },
+            signal = next_signal(&mut events) => match signal {
+                Signal::Event { name, data } if data.get("threadId").and_then(Value::as_str) == Some(thread) => {
+                    let milestone = Milestone::of(&name, &data);
+                    reporter.event(Some(turn), milestone.event(&name), Some(data));
+                    // What the run did up to its milestone.
+                    let shown = show(program, start, thread).await.thread();
+                    if let Some(shown) = &shown {
+                        current = current || RunState::of(shown).run.as_deref() == run;
+                        stream(mcp, cli, thread, shown, current, follow, turn, reporter).await;
+                    }
+                    let Some(shown) = shown else {
+                        if milestone.needs_input || run.is_none() || milestone.run.as_deref() == run {
+                            ended = Some(milestone);
+                        }
+                        continue;
+                    };
+                    if milestone.needs_input {
+                        break (Some(shown), Some(milestone));
+                    }
+                    let theirs = milestone.run.as_deref();
+                    let state = RunState::of(&shown);
+                    let ours = run.is_none() || theirs == run || (current && theirs.is_some() && theirs == state.run.as_deref());
+                    // A later run, or one T3 Code resumes on its own, goes on; a `t3 thread show` that still shows this
+                    // run running is behind the milestone.
+                    let goes_on = state.resumes || (state.running && state.run.as_deref() != theirs);
+                    if ours && !goes_on {
+                        break (Some(shown), Some(milestone));
+                    }
+                }
+                Signal::Event { .. } | Signal::Active => {}
+                Signal::Ended(why) => {
+                    events = None;
+                    live.note(&why, turn, reporter);
+                }
+                Signal::Refused => {
+                    events = None;
+                    live.note("T3 Code refused harnessmux's sign-in", turn, reporter);
+                }
+            },
             command = commands.recv() => match command {
                 Some(Command::Cancel) => {
                     let link = follow.link.clone().unwrap_or_else(|| thread.to_string());
@@ -351,18 +438,28 @@ async fn follow_run(
             },
         }
     };
-    let state = RunState::of(&shown);
+    drop(events);
+    let state = shown.as_ref().map(RunState::of);
     let link = follow.link.clone().unwrap_or_else(|| thread.to_string());
-    if let Some(reply) = state.reply {
+    if let Some(reply) = state.as_ref().and_then(|state| state.reply.clone()) {
         reporter.event(Some(turn), EventBody::Message { text: reply }, None);
     }
-    let body = if state.waiting {
-        waiting(reporter, turn, &link)
-    } else if state.status == "completed" {
+    // The milestone wins over a `t3 thread show` that is behind it.
+    let (waiting, status, ended_run) = match (&milestone, &state) {
+        (Some(milestone), _) => (milestone.needs_input, milestone.outcome.clone().unwrap_or_default(), milestone.run.clone()),
+        (None, Some(state)) => (state.waiting, state.status.clone(), state.run.clone()),
+        (None, None) => (false, String::new(), None),
+    };
+    let body = if waiting {
+        waiting_body(reporter, turn, &link)
+    } else if status == "completed" {
+        if start.record.profile.output_schema.is_some() {
+            read_output(mcp, cli, thread, ended_run.as_deref(), turn, reporter).await;
+        }
         finished(StopReason::EndTurn)
     } else {
-        let status = format!("the T3 Code thread's run ended with status '{}'", state.status);
-        match run_errors(mcp, cli, thread, state.run.as_deref()).await {
+        let status = format!("the T3 Code thread's run ended with status '{status}'");
+        match run_errors(mcp, cli, thread, ended_run.as_deref()).await {
             Ok((errors, resets_at)) if !errors.is_empty() => {
                 let mut failure = Failure::from_text(format!("{status}: {errors} ({link})"));
                 if failure.kind == FailureKind::RateLimited {
@@ -379,6 +476,152 @@ async fn follow_run(
     };
     reporter.event(Some(turn), body, None);
     true
+}
+
+/// The thread's milestone subscriptions for the next turn, and whether the session has said they can't be read.
+#[derive(Default)]
+struct Live {
+    events: Option<Events>,
+    noted: bool,
+}
+
+impl Live {
+    /// Opens the milestones of `filter` (`threadIds`, or `projectIds` before the thread exists) and waits until T3 Code
+    /// has them active, so a run that ends right after is seen. When they can't be read, the turn follows its run by
+    /// polling ([`Live::note`]); the next turn tries again.
+    async fn open(&mut self, mcp: &mut Option<Mcp>, cli: &Cli, filter: Value, turn: u64, reporter: &Reporter) {
+        self.events = None;
+        let opened = async {
+            let connected = match mcp {
+                Some(connected) => connected,
+                None => mcp.insert(Mcp::connect(cli).await.map_err(|error| error.to_string())?),
+            };
+            // A refused token signs in again once, as a tool call does.
+            for renewed in [false, true] {
+                let mut events = connected.events(&MILESTONES, &filter);
+                let mut active = 0;
+                while active < MILESTONES.len() {
+                    match events.signals.recv().await {
+                        Some(Signal::Active) => active += 1,
+                        Some(Signal::Event { .. }) => {}
+                        Some(Signal::Refused) if !renewed => break,
+                        Some(Signal::Refused) => return Err("T3 Code refused harnessmux's new sign-in".to_string()),
+                        Some(Signal::Ended(why)) => return Err(why),
+                        None => return Err("the subscriptions ended".to_string()),
+                    }
+                }
+                if active == MILESTONES.len() {
+                    return Ok(events);
+                }
+                drop(events);
+                connected.renew(cli).await.map_err(|error| error.to_string())?;
+            }
+            Err("T3 Code refused harnessmux's sign-in".to_string())
+        };
+        match tokio::time::timeout(EVENTS_WAIT, opened).await {
+            Ok(Ok(events)) => self.events = Some(events),
+            Ok(Err(why)) => self.note(&why, turn, reporter),
+            Err(_) => self.note(&format!("T3 Code didn't start them in {} seconds", EVENTS_WAIT.as_secs()), turn, reporter),
+        }
+    }
+
+    /// Says once per session that the milestones can't be read.
+    fn note(&mut self, why: &str, turn: u64, reporter: &Reporter) {
+        if !std::mem::replace(&mut self.noted, true) {
+            reporter.notice(
+                Some(turn),
+                format!(
+                    "T3 Code's MCP events can't be read ({why}); turns follow the thread's run by reading `t3 thread show` every {} seconds",
+                    POLL.as_secs()
+                ),
+            );
+        }
+    }
+}
+
+/// The next signal of the milestones; never while there are none.
+async fn next_signal(events: &mut Option<Events>) -> Signal {
+    match events {
+        Some(events) => events.signals.recv().await.unwrap_or_else(|| Signal::Ended("the subscriptions ended".into())),
+        None => std::future::pending().await,
+    }
+}
+
+/// A `thread.run_settled` or `thread.needs_input` milestone of the thread.
+struct Milestone {
+    needs_input: bool,
+    run: Option<String>,
+    outcome: Option<String>,
+    request: Option<String>,
+    kind: Option<String>,
+}
+
+impl Milestone {
+    fn of(name: &str, data: &Value) -> Self {
+        let text = |key: &str| data.get(key).and_then(Value::as_str).map(str::to_string);
+        Self { needs_input: name == "thread.needs_input", run: text("runId"), outcome: text("outcome"), request: text("requestId"), kind: text("kind") }
+    }
+
+    fn event(&self, name: &str) -> EventBody {
+        EventBody::Milestone {
+            name: name.to_string(),
+            run: self.run.clone(),
+            outcome: self.outcome.clone(),
+            request: self.request.clone(),
+            kind: self.kind.clone(),
+        }
+    }
+}
+
+/// Sends the result the run submitted for the profile's output schema as `turn.output`, waiting for T3 Code's
+/// continuation run when the run ended without one; a notice when there is none.
+async fn read_output(mcp: &mut Option<Mcp>, cli: &Cli, thread: &str, run: Option<&str>, turn: u64, reporter: &Reporter) {
+    let deadline = Instant::now() + OUTPUT_WAIT;
+    loop {
+        let mut arguments = json!({"threadId": thread, "untilOutput": true, "timeoutMs": WAIT_MS});
+        if let Some(run) = run {
+            arguments["runId"] = json!(run);
+        }
+        match call(mcp, cli, "t3_thread_wait", arguments).await {
+            Ok(waited) => {
+                if let Some(output) = waited.get("output").filter(|output| !output.is_null()) {
+                    reporter.event(Some(turn), EventBody::Output { output: output.clone() }, None);
+                    return;
+                }
+                if waited.get("timedOut").and_then(Value::as_bool) == Some(true) {
+                    if Instant::now() < deadline {
+                        continue;
+                    }
+                    reporter.notice(
+                        Some(turn),
+                        format!(
+                            "The T3 Code thread's run submitted no result for its output schema (t3_submit_output) in {} minutes",
+                            OUTPUT_WAIT.as_secs() / 60
+                        ),
+                    );
+                    return;
+                }
+                reporter.notice(
+                    Some(turn),
+                    "The T3 Code thread's run submitted no result for its output schema (t3_submit_output), also after T3 Code asked again",
+                );
+                return;
+            }
+            Err(error) => {
+                reporter.notice(Some(turn), format!("could not read the T3 Code thread's result for its output schema: {error}"));
+                return;
+            }
+        }
+    }
+}
+
+/// The output schema file of a `t3 thread start`, removed when dropped.
+struct SchemaFile(PathBuf);
+
+impl Drop for SchemaFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// The error items T3 Code's thread activity (`t3_thread_read`) holds for `run`, such as the provider's rate limit,
@@ -448,7 +691,7 @@ fn finished(stop_reason: StopReason) -> EventBody {
     EventBody::TurnFinished { stop_reason, usage: Usage::default() }
 }
 
-fn waiting(reporter: &Reporter, turn: u64, link: &str) -> EventBody {
+fn waiting_body(reporter: &Reporter, turn: u64, link: &str) -> EventBody {
     reporter.notice(Some(turn), format!("The T3 Code thread waits for an answer; answer it in T3 Code: {link}"));
     finished(StopReason::WaitingForAnswer)
 }
@@ -596,6 +839,8 @@ struct RunState {
     run: Option<String>,
     /// The run's last reply.
     reply: Option<String>,
+    /// The run ended waiting on its own background task or on another thread: T3 Code resumes it on its own.
+    resumes: bool,
 }
 
 impl RunState {
@@ -620,7 +865,7 @@ impl RunState {
         let resumes = status == "waiting"
             && (thread.and_then(|t| t.get("pendingBackgroundTasks")).and_then(Value::as_array).is_some_and(|tasks| !tasks.is_empty())
                 || thread.and_then(|t| t.get("blockedOnThreadWait")).and_then(Value::as_bool) == Some(true));
-        Self { run: run.map(str::to_string), running: matches!(status.as_str(), "running" | "starting") || active || resumes, waiting, status, reply }
+        Self { run: run.map(str::to_string), running: matches!(status.as_str(), "running" | "starting") || active || resumes, waiting, status, reply, resumes }
     }
 }
 
@@ -1003,10 +1248,22 @@ struct Launched {
     run: Option<String>,
 }
 
-/// Starts the session's thread in `worktree` with `t3_thread_launch`, full access.
-async fn launch(mcp: &mut Option<Mcp>, cli: &Cli, start: &Start, worktree: &Path, text: &str) -> Result<Launched> {
+/// Starts the session's thread in `worktree` with `t3_thread_launch`, full access, with the project's milestones open
+/// (the thread has no id yet).
+#[expect(clippy::too_many_arguments, reason = "the run loop's state, passed down")]
+async fn launch(
+    mcp: &mut Option<Mcp>,
+    cli: &Cli,
+    start: &Start,
+    worktree: &Path,
+    text: &str,
+    live: &mut Live,
+    turn: u64,
+    reporter: &Reporter,
+) -> Result<Launched> {
     let project = start.record.project.as_deref().ok_or_else(|| Error::Invalid("a t3 session in a worktree needs its repository".into()))?;
     let project_id = project_id(mcp, cli, project).await?;
+    live.open(mcp, cli, json!({"projectIds": [project_id]}), turn, reporter).await;
     let profile = &start.record.profile;
     let mut arguments = json!({
         "title": profile.title.clone().unwrap_or_else(|| start.record.name.clone()),
@@ -1016,6 +1273,9 @@ async fn launch(mcp: &mut Option<Mcp>, cli: &Cli, start: &Start, worktree: &Path
         "message": text,
         "clientRequestId": request_id(start, "launch"),
     });
+    if let Some(schema) = &profile.output_schema {
+        arguments["outputSchema"] = schema.clone();
+    }
     if let (Some(provider), Some(model)) = (&profile.provider, &profile.model) {
         arguments["modelSelection"] = json!({"instanceId": provider, "model": model});
         let options: Vec<Value> = model_options(profile)

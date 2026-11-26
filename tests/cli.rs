@@ -601,6 +601,20 @@ fn fake_t3_server(dir: &Path, project: &Path) -> String {
                         json(401, serde_json::json!({"error": "invalid_mcp_credential"}))
                     } else if request.get("id").is_none() {
                         (202, String::new())
+                    } else if request["method"] == "events/stream" {
+                        let name = request["params"]["name"].as_str().unwrap().to_string();
+                        log(format!("events {name} {}", request["params"]["arguments"]));
+                        if dir.join("events-fail").exists() {
+                            json(
+                                404,
+                                serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32601, "message": "Method not found: events/stream"}}),
+                            )
+                        } else {
+                            let dir = dir.clone();
+                            let arguments = request["params"]["arguments"].clone();
+                            std::thread::spawn(move || serve_events(stream, &dir, &name, &arguments));
+                            continue;
+                        }
                     } else if request["method"] == "initialize" {
                         json(200, serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": {"protocolVersion": "2025-06-18", "capabilities": {}}}))
                     } else {
@@ -614,10 +628,17 @@ fn fake_t3_server(dir: &Path, project: &Path) -> String {
                                 Err(_) => {
                                     let n = threads.len() + 1;
                                     let id = threads.entry(arguments["clientRequestId"].as_str().unwrap().to_string()).or_insert_with(|| format!("t{n}"));
+                                    std::fs::write(dir.join("launched"), id.as_str()).unwrap();
                                     Ok(thread(id))
                                 }
                             },
                             "t3_thread_send" => Ok(thread(arguments["threadId"].as_str().unwrap())),
+                            "t3_thread_wait" => Ok(match std::fs::read_to_string(dir.join("output.json")) {
+                                Ok(output) => {
+                                    serde_json::json!({"threadId": arguments["threadId"], "runId": "r2", "status": "completed", "timedOut": false, "output": serde_json::from_str::<Value>(&output).unwrap()})
+                                }
+                                Err(_) => serde_json::json!({"threadId": arguments["threadId"], "runId": "r2", "status": "completed", "timedOut": false}),
+                            }),
                             "t3_thread_read"
                                 if arguments.get("itemId").is_none()
                                     && std::fs::read_to_string(dir.join("read-fail-after"))
@@ -723,6 +744,62 @@ fn fake_t3_server(dir: &Path, project: &Path) -> String {
 }
 
 /// The fake T3 Code server's calls of `tool`, with their arguments.
+/// One `events/stream` subscription of the fake T3 Code server, as SSE over chunked transfer: `active`, then each
+/// event once. `thread.run_settled`: the data in `settled.json`, else the run of `show.json` once it neither runs nor
+/// waits for an answer (`outcome`: its status). `thread.needs_input`: once `show.json` has a pending request. The
+/// events name the subscribed thread, or for a project the thread launched last. With `events-drop`, the stream is
+/// terminated.
+#[cfg(unix)]
+fn serve_events(mut stream: std::net::TcpStream, dir: &Path, name: &str, arguments: &Value) {
+    use std::io::Write as _;
+    let send = |stream: &mut std::net::TcpStream, message: Value| {
+        let event = format!("data: {message}\n\n");
+        write!(stream, "{:x}\r\n{event}\r\n", event.len()).and_then(|()| stream.flush())
+    };
+    if write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n").is_err()
+        || send(&mut stream, serde_json::json!({"jsonrpc": "2.0", "method": "notifications/events/active", "params": {"cursor": "c0"}})).is_err()
+    {
+        return;
+    }
+    let mut sent = std::collections::HashSet::new();
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        if dir.join("events-drop").exists() {
+            let _ = send(
+                &mut stream,
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/events/terminated", "params": {"error": {"message": "the server stopped"}}}),
+            );
+            let _ = write!(stream, "0\r\n\r\n");
+            return;
+        }
+        let shown: Value = std::fs::read_to_string(dir.join("show.json")).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default();
+        let thread = &shown["thread"];
+        let id = match arguments["threadIds"][0].as_str() {
+            Some(id) => id.to_string(),
+            None => std::fs::read_to_string(dir.join("launched")).unwrap_or_default(),
+        };
+        let data = match name {
+            "thread.run_settled" => match std::fs::read_to_string(dir.join("settled.json")) {
+                Ok(settled) => serde_json::from_str(&settled).ok(),
+                Err(_) => {
+                    let status = thread["status"].as_str().unwrap_or_default();
+                    let settled = thread.is_object() && thread["activeRunId"].is_null() && !matches!(status, "running" | "starting" | "waiting");
+                    (settled && thread["pendingRequestCount"].as_u64().unwrap_or(0) == 0)
+                        .then(|| serde_json::json!({"type": name, "threadId": id, "runId": thread["latestRunId"], "outcome": status}))
+                }
+            },
+            _ => (thread["pendingRequestCount"].as_u64().unwrap_or(0) > 0)
+                .then(|| serde_json::json!({"type": name, "threadId": id, "requestId": "q1", "kind": "user_input"})),
+        };
+        if let Some(data) = data.filter(|data| sent.insert(data.to_string())) {
+            let event = serde_json::json!({"jsonrpc": "2.0", "method": "notifications/events/event", "params": {"eventId": sent.len().to_string(), "name": name, "data": data}});
+            if send(&mut stream, event).is_err() {
+                return;
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 fn mcp_calls(dir: &Path, tool: &str) -> Vec<Value> {
     let calls = std::fs::read_to_string(dir.join("calls")).unwrap_or_default();
@@ -1299,6 +1376,160 @@ fn a_t3_session_in_a_worktree_launches_its_thread_there_and_sends_later_turns_th
     assert!(other.status.success(), "{}", text(&other));
     assert_eq!(count_calls(&dir, "oauth token"), 1);
     assert_eq!(mcp_calls(&dir, "t3_thread_launch")[1]["title"], "x");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_t3_turn_ends_on_its_runs_milestone_while_thread_show_is_behind() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    let worktree = git_worktree(&home);
+    // `thread show` still shows the run running; the milestone says it completed.
+    show(&dir, "running", r#""r2""#, 0, r#"[{"role":"assistant","runId":"r2","text":"Done."}]"#);
+    std::fs::write(dir.join("settled.json"), r#"{"type":"thread.run_settled","threadId":"t1","runId":"r2","outcome":"completed"}"#).unwrap();
+    let wt = worktree.to_str().unwrap();
+    let run = home.run(&["run", "t3", "--name", "m", "--cwd", wt, "--provider", "claudeAgent", "--model", "m", "Fix it"]);
+    assert!(run.status.success(), "{}", text(&run));
+    let events = home.events("m");
+    let milestone = events.iter().find(|e| e["type"] == "milestone").unwrap();
+    assert_eq!(
+        (&milestone["name"], &milestone["run"], &milestone["outcome"]),
+        (&"thread.run_settled".into(), &"r2".into(), &"completed".into()),
+        "{milestone}"
+    );
+    let finished = events.iter().find(|e| e["type"] == "turn.finished").unwrap();
+    assert_eq!(finished["stop_reason"], "end_turn", "{events:?}");
+    assert!(events.iter().any(|e| e["type"] == "message" && e["text"] == "Done."), "{events:?}");
+    assert!(!events.iter().any(|e| e["type"] == "notice"), "{events:?}");
+
+    // Opened before the thread starts: for the project, then for the thread before each send.
+    let next = home.run(&["send", "m", "--wait", "Go on"]);
+    assert!(next.status.success(), "{}", text(&next));
+    let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+    let at = |prefix: &str| calls.lines().position(|line| line.starts_with(prefix)).unwrap_or_else(|| panic!("no {prefix} in {calls}"));
+    assert!(at(r#"events thread.run_settled {"projectIds":["p1"]}"#) < at("mcp t3_thread_launch"), "{calls}");
+    assert!(at(r#"events thread.needs_input {"projectIds":["p1"]}"#) < at("mcp t3_thread_launch"), "{calls}");
+    assert!(at(r#"events thread.run_settled {"threadIds":["t1"]}"#) < at("mcp t3_thread_send"), "{calls}");
+    assert_eq!(home.events("m").iter().filter(|e| e["type"] == "turn.finished" && e["stop_reason"] == "end_turn").count(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_t3_thread_that_needs_input_ends_the_turn_on_its_milestone() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    let worktree = git_worktree(&home);
+    show(&dir, "running", r#""r2""#, 1, r#"[{"role":"assistant","runId":"r2","text":"Which one?"}]"#);
+    let wt = worktree.to_str().unwrap();
+    let run = home.run(&["run", "t3", "--name", "q", "--cwd", wt, "--provider", "claudeAgent", "--model", "m", "Fix it"]);
+    assert_eq!(run.status.code(), Some(3), "{}", text(&run));
+    let events = home.events("q");
+    let milestone = events.iter().find(|e| e["type"] == "milestone").unwrap();
+    assert_eq!(
+        (&milestone["name"], &milestone["request"], &milestone["kind"]),
+        (&"thread.needs_input".into(), &"q1".into(), &"user_input".into()),
+        "{milestone}"
+    );
+    let finished = events.iter().find(|e| e["type"] == "turn.finished").unwrap();
+    assert_eq!(finished["stop_reason"], "waiting_for_answer", "{events:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_t3_session_whose_events_cant_be_read_follows_its_runs_by_polling_and_says_so_once() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    let worktree = git_worktree(&home);
+    std::fs::write(dir.join("events-fail"), "").unwrap();
+    show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r2","text":"Done."}]"#);
+    let wt = worktree.to_str().unwrap();
+    let run = home.run(&["run", "t3", "--name", "p", "--cwd", wt, "--provider", "claudeAgent", "--model", "m", "Fix it"]);
+    assert!(run.status.success(), "{}", text(&run));
+    let next = home.run(&["send", "p", "--wait", "Go on"]);
+    assert!(next.status.success(), "{}", text(&next));
+    let events = home.events("p");
+    let notices: Vec<&Value> = events.iter().filter(|e| e["type"] == "notice").collect();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    let notice = notices[0]["text"].as_str().unwrap();
+    assert!(
+        notice.contains("MCP events can't be read") && notice.contains("Method not found: events/stream") && notice.contains("every 2 seconds"),
+        "{notice}"
+    );
+    assert_eq!(events.iter().filter(|e| e["type"] == "turn.finished" && e["stop_reason"] == "end_turn").count(), 2, "{events:?}");
+    // Each turn tries again.
+    assert!(count_calls_starting(&dir, "events thread.run_settled") >= 2);
+
+    // A stream that drops mid-turn: the turn goes on by polling.
+    std::fs::remove_file(dir.join("events-fail")).unwrap();
+    show(&dir, "running", r#""r2""#, 0, "[]");
+    let dropped = home.run(&["send", "p", "Once more"]);
+    assert!(dropped.status.success(), "{}", text(&dropped));
+    std::thread::sleep(Duration::from_millis(500));
+    std::fs::write(dir.join("events-drop"), "").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r2","text":"Done."}]"#);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while home.events("p").iter().filter(|e| e["type"] == "turn.finished").count() < 3 {
+        assert!(Instant::now() < deadline, "{:?}", home.events("p"));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(home.events("p").iter().filter(|e| e["type"] == "notice").count(), 1, "said once per session");
+}
+
+#[cfg(unix)]
+fn count_calls_starting(dir: &Path, prefix: &str) -> usize {
+    std::fs::read_to_string(dir.join("calls")).unwrap_or_default().lines().filter(|line| line.starts_with(prefix)).count()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_t3_turn_with_an_output_schema_reports_the_result_its_run_submitted() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    let worktree = git_worktree(&home);
+    show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r2","text":"Done."}]"#);
+    std::fs::write(dir.join("output.json"), r#"{"summary":"Fixed the parser"}"#).unwrap();
+    let schema = home.dir.path().join("schema.json");
+    std::fs::write(&schema, r#"{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}"#).unwrap();
+    let wt = worktree.to_str().unwrap();
+    let schema_arg = schema.to_str().unwrap();
+    let run = home.run(&["run", "t3", "--name", "o", "--cwd", wt, "--provider", "claudeAgent", "--model", "m", "--output-schema", schema_arg, "Fix it"]);
+    assert!(run.status.success(), "{}", text(&run));
+    let wanted: Value = serde_json::from_str(&std::fs::read_to_string(&schema).unwrap()).unwrap();
+    assert_eq!(mcp_calls(&dir, "t3_thread_launch")[0]["outputSchema"], wanted);
+    let waits = mcp_calls(&dir, "t3_thread_wait");
+    assert_eq!((&waits[0]["threadId"], &waits[0]["runId"], &waits[0]["untilOutput"]), (&"t1".into(), &"r2".into(), &true.into()), "{waits:?}");
+    let events = home.events("o");
+    let kinds: Vec<&str> = events.iter().filter(|e| e["turn"] == 1).filter_map(|e| e["type"].as_str()).filter(|kind| !kind.ends_with(".delta")).collect();
+    assert_eq!(kinds, ["turn.started", "milestone", "message", "turn.output", "turn.finished"], "{events:?}");
+    let output = events.iter().find(|e| e["type"] == "turn.output").unwrap();
+    assert_eq!(output["output"], serde_json::json!({"summary": "Fixed the parser"}));
+
+    let next = home.run(&["send", "o", "--wait", "Go on"]);
+    assert!(next.status.success(), "{}", text(&next));
+    assert_eq!(mcp_calls(&dir, "t3_thread_send")[0]["outputSchema"], wanted);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_t3_turn_whose_run_submitted_no_result_says_so() {
+    let home = home(&[]);
+    let dir = fake_t3(&home);
+    std::fs::write(dir.join("start-exit"), "0").unwrap();
+    show(&dir, "completed", "null", 0, r#"[{"role":"assistant","runId":"r2","text":"Done."}]"#);
+    let schema = home.dir.path().join("schema.json");
+    std::fs::write(&schema, r#"{"type":"object"}"#).unwrap();
+    let run = home.run(&["run", "t3", "--name", "n", "--output-schema", schema.to_str().unwrap(), "Fix it"]);
+    assert!(run.status.success(), "{}", text(&run));
+    // `t3 thread start` gets the schema as a file, removed after the turn.
+    let args = std::fs::read_to_string(dir.join("start-args")).unwrap();
+    let file = args.split_whitespace().skip_while(|arg| *arg != "--output-schema").nth(1).unwrap_or_else(|| panic!("{args}"));
+    assert!(!Path::new(file).exists(), "{file}");
+    let events = home.events("n");
+    let notice = events.iter().find(|e| e["type"] == "notice").unwrap();
+    assert!(notice["text"].as_str().unwrap().contains("submitted no result for its output schema"), "{notice}");
+    assert!(!events.iter().any(|e| e["type"] == "turn.output"), "{events:?}");
+    assert_eq!(events.iter().find(|e| e["type"] == "turn.finished").unwrap()["stop_reason"], "end_turn");
 }
 
 #[cfg(unix)]
