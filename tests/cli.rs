@@ -1478,6 +1478,8 @@ fn a_t3_session_whose_events_cant_be_read_follows_its_runs_by_polling_and_says_s
     let wt = worktree.to_str().unwrap();
     let run = home.run(&["run", "t3", "--name", "p", "--cwd", wt, "--provider", "claudeAgent", "--model", "m", "Fix it"]);
     assert!(run.status.success(), "{}", text(&run));
+    // A turn's first failed subscription ends the others, at times before they are sent: count both milestones.
+    let tried = count_calls_starting(&dir, "events thread.");
     let next = home.run(&["send", "p", "--wait", "Go on"]);
     assert!(next.status.success(), "{}", text(&next));
     let events = home.events("p");
@@ -1490,7 +1492,7 @@ fn a_t3_session_whose_events_cant_be_read_follows_its_runs_by_polling_and_says_s
     );
     assert_eq!(events.iter().filter(|e| e["type"] == "turn.finished" && e["stop_reason"] == "end_turn").count(), 2, "{events:?}");
     // Each turn tries again.
-    assert!(count_calls_starting(&dir, "events thread.run_settled") >= 2);
+    assert!(tried >= 1 && count_calls_starting(&dir, "events thread.") > tried, "{tried}");
 
     // A stream that drops mid-turn: the turn goes on by polling.
     std::fs::remove_file(dir.join("events-fail")).unwrap();
