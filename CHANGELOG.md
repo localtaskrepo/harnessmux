@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.1 (2026-11-26)
+## 0.5.0 (2026-11-26)
 
 - A t3 session can run its thread on a linked T3 Code environment: `run --environment <id|label>` (profile
   `environment`). Every MCP call names it; its first turn is `t3_thread_launch`, reads are `t3_thread_read` and turns
